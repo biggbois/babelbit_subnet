@@ -48,6 +48,140 @@ class _SequenceSession:
         return self._responses.pop(0)
 
 
+@pytest.fixture(autouse=True)
+def _mock_gateway_discovery_headers():
+    with patch(
+        "babelbit.utils.managed_container_registry._get_gateway_discovery_headers",
+        new_callable=AsyncMock,
+        return_value={"Authorization": "Bearer token", "Content-Type": "application/json"},
+    ):
+        yield
+
+
+@pytest.mark.asyncio
+async def test_fetch_live_containers_sends_gateway_auth_on_first_request():
+    responses = [
+        _MockResponse(
+            200,
+            payload={
+                "status": "ok",
+                "count": 1,
+                "miners": [
+                    {
+                        "hotkey": "hk1",
+                        "uid": 1,
+                    }
+                ],
+            },
+            text_data='{"status":"ok","count":1,"miners":[{"hotkey":"hk1","uid":1}]}',
+        ),
+    ]
+    session = _SequenceSession(responses)
+
+    mock_settings = type(
+        "S",
+        (),
+        {
+            "BB_SUBMIT_API_URL": "http://gateway-api:8079",
+            "BB_ARENA_CONTAINERS_API_PATH": "/list_arena_miners",
+            "BB_ARENA_CONTAINERS_STATUS": "running",
+            "BB_ARENA_CONTAINERS_WINDOW_SECONDS": 300,
+            "BB_ARENA_CONTAINERS_TIMEOUT_SEC": 10,
+            "BB_ARENA_RUNSYNC_API_PATH": "/runsync",
+            "BB_MINER_PREDICT_ENDPOINT": "predict",
+        },
+    )()
+
+    with patch(
+        "babelbit.utils.managed_container_registry.get_settings",
+        return_value=mock_settings,
+    ), patch(
+        "babelbit.utils.managed_container_registry.get_async_client",
+        new_callable=AsyncMock,
+        return_value=session,
+    ), patch(
+        "babelbit.utils.managed_container_registry._get_gateway_discovery_headers",
+        new_callable=AsyncMock,
+        return_value={"Authorization": "Bearer token", "Content-Type": "application/json"},
+    ) as mock_get_gateway_headers:
+        containers = await fetch_live_containers(timeout=5)
+
+    assert len(containers) == 1
+    assert containers[0]["miner_hotkey"] == "hk1"
+    assert len(session.calls) == 1
+    assert session.calls[0]["kwargs"]["headers"]["Authorization"] == "Bearer token"
+    mock_get_gateway_headers.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fetch_live_containers_refreshes_gateway_auth_after_401():
+    responses = [
+        _MockResponse(
+            401,
+            text_data='{"error":{"code":"invalid_auth_token","message":"Invalid auth token"}}',
+        ),
+        _MockResponse(
+            200,
+            payload={
+                "status": "ok",
+                "count": 1,
+                "miners": [
+                    {
+                        "hotkey": "hk1",
+                        "uid": 1,
+                    }
+                ],
+            },
+            text_data='{"status":"ok","count":1,"miners":[{"hotkey":"hk1","uid":1}]}',
+        ),
+    ]
+    session = _SequenceSession(responses)
+
+    mock_settings = type(
+        "S",
+        (),
+        {
+            "BB_SUBMIT_API_URL": "http://gateway-api:8079",
+            "BB_ARENA_CONTAINERS_API_PATH": "/list_arena_miners",
+            "BB_ARENA_CONTAINERS_STATUS": "running",
+            "BB_ARENA_CONTAINERS_WINDOW_SECONDS": 300,
+            "BB_ARENA_CONTAINERS_TIMEOUT_SEC": 10,
+            "BB_ARENA_RUNSYNC_API_PATH": "/runsync",
+            "BB_MINER_PREDICT_ENDPOINT": "predict",
+        },
+    )()
+
+    with patch(
+        "babelbit.utils.managed_container_registry.get_settings",
+        return_value=mock_settings,
+    ), patch(
+        "babelbit.utils.managed_container_registry.get_async_client",
+        new_callable=AsyncMock,
+        return_value=session,
+    ), patch(
+        "babelbit.utils.managed_container_registry._get_gateway_discovery_headers",
+        new_callable=AsyncMock,
+        side_effect=[
+            {"Authorization": "Bearer stale-token", "Content-Type": "application/json"},
+            {"Authorization": "Bearer token", "Content-Type": "application/json"},
+        ],
+    ) as mock_get_gateway_headers, patch(
+        "babelbit.utils.managed_container_registry._get_validator_identity",
+        return_value={"hotkey": "validator-hk"},
+    ), patch(
+        "babelbit.utils.managed_container_registry._clear_gateway_auth_token",
+    ) as mock_clear_gateway_auth_token:
+        containers = await fetch_live_containers(timeout=5)
+
+    assert len(containers) == 1
+    assert containers[0]["miner_hotkey"] == "hk1"
+    assert len(session.calls) == 2
+    assert session.calls[0]["kwargs"]["headers"]["Authorization"] == "Bearer stale-token"
+    assert session.calls[1]["kwargs"]["headers"]["Authorization"] == "Bearer token"
+    assert mock_get_gateway_headers.await_count == 2
+    mock_clear_gateway_auth_token.assert_called_once()
+
+
 @pytest.mark.asyncio
 async def test_fetch_live_containers_validates_payload_shape():
     payload = {
@@ -91,6 +225,67 @@ async def test_fetch_live_containers_validates_payload_shape():
     assert containers[0]["endpoint_url"] == "http://containers-api:8080/runsync"
     assert session.last_get_kwargs is not None
     assert session.last_get_kwargs["kwargs"]["params"]["window_seconds"] == 123
+
+
+@pytest.mark.asyncio
+async def test_fetch_live_containers_default_discovery_includes_stopped_pods():
+    responses = [
+        _MockResponse(200, payload={"status": "ok", "count": 0, "containers": []}),
+        _MockResponse(200, payload={"status": "ok", "count": 0, "containers": []}),
+        _MockResponse(200, payload={"status": "ok", "count": 0, "containers": []}),
+        _MockResponse(200, payload={"status": "ok", "count": 0, "containers": []}),
+        _MockResponse(200, payload={"status": "ok", "count": 0, "containers": []}),
+        _MockResponse(
+            200,
+            payload={
+                "status": "ok",
+                "count": 1,
+                "containers": [
+                    {
+                        "miner_hotkey": "hk-stopped",
+                        "miner_uid": 9,
+                        "endpoint_url": "http://gateway/runsync",
+                        "raw_endpoint_url": "https://pod.proxy.runpod.net",
+                        "provider": "gateway",
+                        "status": "warming",
+                        "endpoint_type": "POD",
+                        "endpoint_id": "pod-1",
+                        "container_name": "ctr-stopped",
+                    }
+                ],
+            },
+        ),
+    ]
+    session = _SequenceSession(responses)
+
+    mock_settings = type(
+        "S",
+        (),
+        {
+            "BB_SUBMIT_API_URL": "http://containers-api:8080",
+            "BB_ARENA_CONTAINERS_API_PATH": "/list_arena_miners",
+            "BB_ARENA_CONTAINERS_STATUS": "running",
+            "BB_ARENA_CONTAINERS_WINDOW_SECONDS": 300,
+            "BB_ARENA_CONTAINERS_TIMEOUT_SEC": 10,
+            "BB_ARENA_RUNSYNC_API_PATH": "/runsync",
+            "BB_MINER_PREDICT_ENDPOINT": "predict",
+        },
+    )()
+
+    with patch("babelbit.utils.managed_container_registry.get_settings", return_value=mock_settings), \
+         patch("babelbit.utils.managed_container_registry.get_async_client", new_callable=AsyncMock, return_value=session):
+        containers = await fetch_live_containers(timeout=5)
+
+    assert len(containers) == 1
+    assert containers[0]["miner_hotkey"] == "hk-stopped"
+    assert [call["kwargs"]["params"].get("status") for call in session.calls] == [
+        "running",
+        "warming",
+        "idle",
+        "unhealthy",
+        "unavailable",
+        "stopped",
+    ]
 
 
 @pytest.mark.asyncio
@@ -290,6 +485,52 @@ async def test_fetch_live_containers_uses_single_call_for_arena_miners_payload()
 
 
 @pytest.mark.asyncio
+async def test_fetch_live_containers_widens_default_running_status_for_warmable_pods():
+    payload = {
+        "status": "ok",
+        "count": 0,
+        "containers": [],
+    }
+
+    class _MultiStatusSession:
+        def __init__(self):
+            self.called_statuses = []
+
+        def get(self, *args, **kwargs):
+            self.called_statuses.append(kwargs["params"].get("status", ""))
+            return _MockResponse(200, payload=payload)
+
+    session = _MultiStatusSession()
+    mock_settings = type(
+        "S",
+        (),
+        {
+            "BB_SUBMIT_API_URL": "http://containers-api:8080",
+            "BB_ARENA_CONTAINERS_API_PATH": "/list_arena_miners",
+            "BB_ARENA_CONTAINERS_STATUS": "running",
+            "BB_ARENA_CONTAINERS_WINDOW_SECONDS": 300,
+            "BB_ARENA_CONTAINERS_TIMEOUT_SEC": 10,
+            "BB_ARENA_RUNSYNC_API_PATH": "/runsync",
+            "BB_MINER_PREDICT_ENDPOINT": "predict",
+        },
+    )()
+
+    with patch("babelbit.utils.managed_container_registry.get_settings", return_value=mock_settings), \
+         patch("babelbit.utils.managed_container_registry.get_async_client", new_callable=AsyncMock, return_value=session):
+        containers = await fetch_live_containers(timeout=5)
+
+    assert containers == []
+    assert session.called_statuses == [
+        "running",
+        "warming",
+        "idle",
+        "unhealthy",
+        "unavailable",
+        "stopped",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_resolve_round2_routes_intersects_with_onchain_miners():
     miners = {
         1: Miner(uid=1, hotkey="hk1", block=100, axon_ip="1.1.1.1", axon_port=8091),
@@ -322,7 +563,31 @@ async def test_resolve_round2_routes_intersects_with_onchain_miners():
     assert "hk1" in routes_by_hotkey
     assert routes_by_hotkey["hk1"].endpoint_url == "http://managed-1:9000/predict"
     assert routes_by_hotkey["hk1"].provider == "managed_container"
+    assert routes_by_hotkey["hk1"].miner_uid == 1
     assert "hk2" not in routes_by_hotkey
+
+
+@pytest.mark.asyncio
+async def test_resolve_round2_routes_backfills_uid_from_hotkey_match():
+    miners = {
+        8: Miner(uid=8, hotkey="hk8", block=100, axon_ip="2.2.2.2", axon_port=8091),
+    }
+    containers = [
+        {
+            "miner_hotkey": "hk8",
+            "provider": "gateway",
+            "endpoint_url": "http://gateway.test/runsync",
+            "status": "unhealthy",
+        }
+    ]
+
+    with patch("babelbit.utils.managed_container_registry.get_miners_from_registry", new_callable=AsyncMock, return_value=miners):
+        round2_miners, routes_by_hotkey = await resolve_round2_routes(netuid=42, containers=containers)
+
+    assert [m.hotkey for m in round2_miners] == ["hk8"]
+    assert routes_by_hotkey["hk8"].provider == "gateway"
+    assert routes_by_hotkey["hk8"].miner_uid == 8
+    assert routes_by_hotkey["hk8"].endpoint_url == "http://gateway.test/runsync"
 
 
 @pytest.mark.asyncio
@@ -403,6 +668,32 @@ async def test_resolve_round2_routes_accepts_url_field_from_live_containers():
     assert [m.hotkey for m in round2_miners] == ["hk8"]
     assert routes_by_hotkey["hk8"].endpoint_url == "https://serv-u-1.serverless.targon.com"
     assert routes_by_hotkey["hk8"].provider == "managed_container"
+
+
+@pytest.mark.asyncio
+async def test_resolve_round2_routes_preserves_pod_metadata():
+    miners = {
+        9: Miner(uid=9, hotkey="hk9", block=100, axon_ip="3.3.3.3", axon_port=8091),
+    }
+    containers = [
+        {
+            "miner_hotkey": "hk9",
+            "endpoint_url": "http://149.36.1.29:13426",
+            "endpoint_id": "zrhjcj1p2df7fd",
+            "endpoint_type": "POD",
+            "status": "unhealthy",
+            "container_name": "ctr-hk9",
+        }
+    ]
+
+    with patch("babelbit.utils.managed_container_registry.get_miners_from_registry", new_callable=AsyncMock, return_value=miners):
+        round2_miners, routes_by_hotkey = await resolve_round2_routes(netuid=42, containers=containers)
+
+    assert [m.hotkey for m in round2_miners] == ["hk9"]
+    assert routes_by_hotkey["hk9"].endpoint_url == "http://149.36.1.29:13426"
+    assert routes_by_hotkey["hk9"].endpoint_id == "zrhjcj1p2df7fd"
+    assert routes_by_hotkey["hk9"].endpoint_type == "POD"
+    assert routes_by_hotkey["hk9"].status == "unhealthy"
 
 @pytest.mark.asyncio
 async def test_resolve_round2_routes_accepts_soft_terminated_endpoint_from_metadata():

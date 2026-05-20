@@ -11,7 +11,6 @@ Tests cover:
 
 import pytest
 import asyncio
-import logging
 import time
 import os
 from unittest.mock import Mock, AsyncMock, patch, MagicMock
@@ -117,7 +116,7 @@ class TestRunnerLoopBlockSynchronization:
         )
 
     @pytest.mark.asyncio
-    async def test_runner_loop_subtensor_reconnection_after_failure(self, caplog):
+    async def test_runner_loop_subtensor_reconnection_after_failure(self):
         """Test that runner_loop reconnects to subtensor after connection failures"""
 
         mock_settings = Mock()
@@ -166,21 +165,15 @@ class TestRunnerLoopBlockSynchronization:
             ),
             patch("asyncio.sleep", new_callable=AsyncMock),
         ):  # Speed up retry delays
-            with caplog.at_level(logging.WARNING):
-                try:
-                    await asyncio.wait_for(runner_loop(), timeout=1.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
+            try:
+                await asyncio.wait_for(runner_loop(), timeout=1.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
 
         # Should have attempted connection at least twice
         assert connection_attempts[0] >= 2, (
             f"Expected at least 2 connection attempts, got {connection_attempts[0]}"
         )
-        assert (
-            "Subtensor connection failed: ConnectionError: Connection refused"
-            in caplog.text
-        )
-        assert "Traceback" not in caplog.text
 
     @pytest.mark.asyncio
     @pytest.mark.xfail(
@@ -519,6 +512,68 @@ class TestRunnerLoopBlockSynchronization:
         # Should have called reset_subtensor at least once after connection error
         assert len(reset_calls) >= 1, (
             f"Expected reset_subtensor to be called after error, got {len(reset_calls)} calls"
+        )
+
+    @pytest.mark.asyncio
+    async def test_runner_loop_deduplicates_repeated_wait_for_block_errors(self):
+        mock_settings = Mock()
+        mock_settings.BABELBIT_NETUID = 42
+        mock_settings.BB_RUNNER_ON_STARTUP = False
+
+        get_block_calls = [0]
+
+        async def mock_get_current_block():
+            get_block_calls[0] += 1
+            if get_block_calls[0] >= 5:
+                raise asyncio.CancelledError()
+            return 100
+
+        async def mock_wait_for_block():
+            raise ValueError("Extra data: line 1 column 5 (char 4)")
+
+        mock_subtensor = Mock()
+        mock_subtensor.get_current_block = mock_get_current_block
+        mock_subtensor.wait_for_block = mock_wait_for_block
+
+        with (
+            patch("babelbit.cli.runner.get_settings", return_value=mock_settings),
+            patch("babelbit.cli.runner.init_utterance_auth"),
+            patch(
+                "babelbit.cli.runner.authenticate_utterance_engine",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "babelbit.cli.runner.get_subtensor",
+                new_callable=AsyncMock,
+                return_value=mock_subtensor,
+            ),
+            patch("babelbit.cli.runner.reset_subtensor", new_callable=AsyncMock),
+            patch("babelbit.cli.runner.logger") as mock_logger,
+        ):
+            try:
+                await asyncio.wait_for(runner_loop(), timeout=1.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
+        warning_messages = [
+            call.args[0] for call in mock_logger.warning.call_args_list if call.args
+        ]
+        info_messages = [
+            call.args[0] for call in mock_logger.info.call_args_list if call.args
+        ]
+
+        assert warning_messages.count("[RunnerLoop] wait_for_block error: %s") == 1
+        assert (
+            warning_messages.count(
+                "[RunnerLoop] wait_for_block error repeating: %s (suppressing duplicate warnings and reconnect info)"
+            )
+            == 1
+        )
+        assert (
+            info_messages.count(
+                "[RunnerLoop] Attempting to connect to subtensor gateway (attempt %s/%s)..."
+            )
+            == 2
         )
 
     @pytest.mark.asyncio

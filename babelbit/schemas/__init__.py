@@ -1,11 +1,19 @@
-from babelbit.schemas.prediction import (
-    BBUtteranceEvaluation,
-    BBPredictedUtterance,
-    BBPredictOutput,
+from babelbit.schemas.audio_prediction import (
+    BBAudioUEUtterance,
+    BBAudioMinerInitPayload,
+    BBAudioMinerInitResponse,
+    BBAudioMinerPredictPayload,
+    BBAudioMinerPredictResponse,
+    BBAudioUtteranceResult,
+    BBAudioChallengeResult,
 )
 
 __all__ = [
-    "BBUtteranceEvaluation",
-    "BBPredictedUtterance",
-    "BBPredictOutput",
+    "BBAudioUEUtterance",
+    "BBAudioMinerInitPayload",
+    "BBAudioMinerInitResponse",
+    "BBAudioMinerPredictPayload",
+    "BBAudioMinerPredictResponse",
+    "BBAudioUtteranceResult",
+    "BBAudioChallengeResult",
 ]

@@ -1,28 +1,99 @@
-# min_compute.yml: Hardware specs for Babelbit Subnet (validator/miner setup)
-# Derived from repo requirements: CPU for orchestration/DB, GPU for ML tasks, RAM for model loading, storage for logs/models.
-# Usage: Adapt for your provider (e.g., AWS EC2 instance types like t3.medium for min, g4dn.xlarge for rec).
+# Minimum compute guidance for the Babelbit private validator.
+#
+# This file is intentionally based on observed CPU-only audio scoring behavior
+# in this repo rather than generic cloud sizing.
+#
+# Benchmark basis:
+#   .venv/bin/python tests/benchmarks/stress_stt.py \
+#     --miners 50 100 150 200 250 \
+#     --durations-sec 60 \
+#     --audio-kind mixed \
+#     --stt-model faster-whisper-small \
+#     --stt-device cpu \
+#     --warmup 0 \
+#     --repeat 1 \
+#     --json
+#
+# Repo defaults used by the runner:
+#   BB_AUDIO_SCORING_STT_MODEL=faster-whisper-small
+#   BB_AUDIO_SCORING_STT_DEVICE=cpu
+#
+# Practical takeaway from testing:
+# - 4 vCPU / 8 GB RAM on DigitalOcean Regular Intel was too slow for validator
+#   scoring and would take hours on larger batches.
+# - 8 vCPU / 16 GB RAM on DigitalOcean Premium AMD completed the same
+#   250-miner / 60-second synthetic STT batch in about 24 minutes.
+# - Because this benchmark is STT-only, these numbers should be treated as the
+#   floor for acceptable validator performance, not a generous recommendation.
 
 specs:
   minimum:
-    # Basic CPU-only setup for testing (e.g., AWS t3.medium, ~$0.04/hr)
-    cpu: 2  # Cores/vCPUs; sufficient for Docker orchestration and light validation
-    ram_gb: 4  # GB; handles basic env loading and small models
-    gpu: 0  # None; CPU fallback for inference (slow for training)
-    storage_gb: 50  # GB SSD; for OS, Docker images, small datasets, and Postgres DB
-    network: low  # <100 Mbps; fine for local/API calls
-    os: ubuntu-22.04  # Or similar; repo uses pip/uv for Python deps
+    cpu: 8
+    ram_gb: 16
+    gpu: 0
+    storage_gb: 80
+    network: moderate
+    os: ubuntu-22.04
+    profile: cpu-only validator floor for default audio scoring
+    rationale:
+      - Matches the first tested machine that completed default CPU STT scoring in a reasonable window.
+      - Sized for faster-whisper-small on CPU plus validator services and cache growth.
+      - Anything below this, especially 4 vCPU / 8 GB RAM, should be treated as unsupported for production scoring.
 
   recommended:
-    # GPU-enabled for efficient ML training/deployment (e.g., AWS g4dn.xlarge, ~$0.50/hr)
-    cpu: 4  # Cores/vCPUs; supports concurrent validators/miners and DB queries
-    ram_gb: 16  # GB; for loading larger Huggingface models and Chutes deployments
-    gpu: 1  # NVIDIA T4 or equivalent (16GB VRAM); accelerates training/inference
-    storage_gb: 200  # GB NVMe SSD; for models, logs, S3 caching, and expanded Postgres
-    network: high  # >1 Gbps; for Bittensor P2P, model pushes to Chutes/HF
-    os: ubuntu-22.04  # With NVIDIA drivers/CUDA for GPU
+    cpu: 8
+    ram_gb: 16
+    gpu: 0
+    storage_gb: 120
+    network: high
+    os: ubuntu-22.04
+    profile: stable cpu-only validator for current scoring defaults
+    rationale:
+      - Same compute tier as the successful AMD benchmark box.
+      - Leaves more room for Docker layers, Hugging Face cache, score artifacts, and logs.
+      - Suitable when you intend to keep the current default STT model and device settings.
+
+  below_minimum_observed:
+    cpu: 4
+    ram_gb: 8
+    gpu: 0
+    status: not recommended
+    platform_estimate: DigitalOcean Regular Intel
+    cpu_family_estimate: Intel Broadwell Xeon class
+    rationale:
+      - Observed on a DigitalOcean Regular Intel VM.
+      - `lscpu` reported `GenuineIntel`, family `6`, model `79`, which is consistent with Broadwell-era Xeon hosts under KVM.
+      - Expected scoring time stretched into hours for the same workload shape.
+      - Not appropriate for timely validator scoring.
+
+benchmark_summary:
+  workload:
+    miners: 250
+    utterance_duration_sec: 60
+    total_audio_sec: 15000
+    audio_kind: mixed
+    stt_model: faster-whisper-small
+    stt_device: cpu
+  observed_on_successful_box:
+    cpu: 8 vCPU
+    ram_gb: 16
+    platform_estimate: DigitalOcean Premium AMD
+    cpu_family_estimate: AMD EPYC Rome / Zen 2 class
+    wall_sec: 1402.095
+    stt_wall_sec: 1396.263
+    max_rss_mb: 2517.895
+    audio_sec_per_wall_sec: 10.698
+    notes:
+      - `lscpu` reported `AuthenticAMD`, family `23`, model `49`, and `DO-Premium-AMD`, which is consistent with a Premium AMD droplet backed by EPYC-class CPUs.
+      - About 23 to 24 minutes for the STT portion of scoring.
+      - This benchmark does not include the full scoring stack such as embeddings, metadata lookup, and persistence.
+
+runner_defaults:
+  stt_model: faster-whisper-small
+  stt_device: cpu
+  embedder: all-MiniLM-L6-v2
 
 notes:
-  - **Dependencies**: Ensure CUDA 11.8+ for GPU (if used); repo uses PyTorch implicitly via Chutes.
-  - **Scaling**: For high-traffic subnets, scale to 8+ CPU/32GB RAM/multi-GPU.
-  - **Cost Estimate**: Min ~$30/month on cloud; Rec ~$350/month (spot instances can reduce).
-  - **Source**: Inferred from repo's Docker, Postgres, and ML deployment needs (no explicit specs provided).
+  - If runner defaults change to a larger STT model, revisit this file.
+  - If you need materially faster scoring windows, move above this floor rather than below it.
+  - Storage should account for OS, virtualenv, Docker images, logs, score artifacts, and Hugging Face model cache.

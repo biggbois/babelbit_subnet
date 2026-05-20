@@ -8,6 +8,14 @@ from aiohttp import ClientTimeout
 
 from babelbit.utils.async_clients import get_async_client
 from babelbit.utils.miner_registry import Miner, get_miners_from_registry
+from babelbit.utils.predict_engine import (
+    _clear_gateway_auth_token,
+    _derive_gateway_auth_url,
+    _get_cached_gateway_auth_token,
+    _get_validator_identity,
+    _request_gateway_auth_token,
+    _store_gateway_auth_token,
+)
 from babelbit.utils.settings import get_settings
 
 logger = getLogger(__name__)
@@ -19,6 +27,8 @@ class ManagedRoute:
     endpoint_url: str
     miner_uid: Optional[int] = None
     provider: str = "managed_container"
+    endpoint_id: Optional[str] = None
+    endpoint_type: Optional[str] = None
     status: Optional[str] = None
     container_name: Optional[str] = None
     last_seen_at: Optional[str] = None
@@ -176,6 +186,8 @@ def _to_managed_route(item: Dict[str, Any]) -> Optional[ManagedRoute]:
     )
 
     status_val = item.get("status")
+    endpoint_id = item.get("endpoint_id")
+    endpoint_type = item.get("endpoint_type")
     container_name = item.get("container_name")
     last_seen_at = item.get("last_seen_at")
 
@@ -184,6 +196,8 @@ def _to_managed_route(item: Dict[str, Any]) -> Optional[ManagedRoute]:
         endpoint_url=endpoint_url,
         miner_uid=miner_uid,
         provider=provider,
+        endpoint_id=str(endpoint_id) if endpoint_id is not None else None,
+        endpoint_type=str(endpoint_type) if endpoint_type is not None else None,
         status=str(status_val) if status_val is not None else None,
         container_name=str(container_name) if container_name is not None else None,
         last_seen_at=str(last_seen_at) if last_seen_at is not None else None,
@@ -231,6 +245,121 @@ def _candidate_discovery_paths(api_base: str, api_path: str) -> List[str]:
     return candidates
 
 
+def _discovery_status_filters(
+    status: Optional[str],
+    default_status: str,
+) -> List[str]:
+    req_status = status if status is not None else default_status
+    status_filters = [str(req_status or "").strip()] if req_status is not None else [""]
+    if len(status_filters) == 1 and "," in status_filters[0]:
+        status_filters = [part.strip() for part in status_filters[0].split(",") if part.strip()]
+    status_filters = [value for value in status_filters if value]
+    if not status_filters:
+        status_filters = ["running"]
+    # Default Round2 discovery should keep warmable POD routes visible so the
+    # direct predictor can start/wait on them instead of filtering them out.
+    if status is None and status_filters == ["running"]:
+        return ["running", "warming", "idle", "unhealthy", "unavailable", "stopped"]
+    return status_filters
+
+
+def _looks_like_auth_token_error(status: int, text: str) -> bool:
+    if status != 401:
+        return False
+    normalized = (text or "").lower()
+    return "invalid_auth_token" in normalized or "auth token" in normalized
+
+
+def _gateway_discovery_auth_cache_key(auth_url: str, validator_hotkey: str) -> str:
+    return f"discovery|{auth_url}|{validator_hotkey}"
+
+
+async def _get_gateway_discovery_headers(
+    *,
+    auth_url: str,
+    timeout: float,
+    force_refresh: bool = False,
+) -> Dict[str, str]:
+    validator_identity = _get_validator_identity()
+    auth_cache_key = _gateway_discovery_auth_cache_key(
+        auth_url=auth_url,
+        validator_hotkey=str(validator_identity["hotkey"]),
+    )
+
+    auth_token = "" if force_refresh else _get_cached_gateway_auth_token(auth_cache_key)
+    if not auth_token:
+        token, expires_in, auth_error = await _request_gateway_auth_token(
+            auth_url=auth_url,
+            validator_identity=validator_identity,
+            miner_hotkey="discovery",
+            miner_uid=0,
+            timeout=timeout,
+        )
+        if not token:
+            raise RuntimeError(f"arena miners discovery auth failed: {auth_error}")
+        auth_token = token
+        _store_gateway_auth_token(auth_cache_key, auth_token, expires_in)
+
+    return {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _request_discovery_payload(
+    session,
+    *,
+    url: str,
+    auth_url: str,
+    params: Dict[str, Any],
+    timeout: float,
+) -> Tuple[int, str, Optional[Dict[str, Any]]]:
+    auth_headers = await _get_gateway_discovery_headers(auth_url=auth_url, timeout=timeout)
+    request_kwargs: Dict[str, Any] = {
+        "headers": auth_headers,
+        "params": params,
+        "timeout": ClientTimeout(total=timeout),
+    }
+    attempted_reauth_retry = False
+
+    while True:
+        async with session.get(url, **request_kwargs) as response:
+            text = await response.text()
+            payload: Optional[Dict[str, Any]] = None
+            if response.status == 200:
+                try:
+                    loaded = loads(text) if text.strip() else await response.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"arena miners API returned invalid JSON: {exc}"
+                    ) from exc
+                if not isinstance(loaded, dict):
+                    raise RuntimeError("arena miners API payload must be an object")
+                payload = loaded
+
+            if _looks_like_auth_token_error(response.status, text) and not attempted_reauth_retry:
+                validator_identity = _get_validator_identity()
+                _clear_gateway_auth_token(
+                    _gateway_discovery_auth_cache_key(
+                        auth_url=auth_url,
+                        validator_hotkey=str(validator_identity["hotkey"]),
+                    )
+                )
+                request_kwargs["headers"] = await _get_gateway_discovery_headers(
+                    auth_url=auth_url,
+                    timeout=timeout,
+                    force_refresh=True,
+                )
+                attempted_reauth_retry = True
+                logger.info(
+                    "Arena discovery auth received 401; refreshed gateway auth and retrying %s once",
+                    url,
+                )
+                continue
+
+            return response.status, text, payload
+
+
 async def fetch_live_containers(
     *,
     path: Optional[str] = None,
@@ -259,8 +388,14 @@ async def fetch_live_containers(
         api_base=gateway_base,
         runsync_path=getattr(settings, "BB_ARENA_RUNSYNC_API_PATH", "/runsync"),
     )
+    gateway_auth_url = _derive_gateway_auth_url(
+        gateway_runsync_url=gateway_runsync_url,
+        auth_path=getattr(settings, "BB_ARENA_GATEWAY_AUTH_API_PATH", "/auth/token"),
+        runsync_path=getattr(settings, "BB_ARENA_RUNSYNC_API_PATH", "/runsync"),
+    )
+    if not gateway_auth_url:
+        raise RuntimeError("BB_ARENA_GATEWAY_AUTH_API_PATH resolved to an empty auth URL")
 
-    req_status = status if status is not None else settings.BB_ARENA_CONTAINERS_STATUS
     req_window_seconds = (
         int(window_seconds)
         if window_seconds is not None
@@ -273,12 +408,10 @@ async def fetch_live_containers(
     )
 
     session = await get_async_client()
-    status_filters = [str(req_status or "").strip()] if req_status is not None else [""]
-    if len(status_filters) == 1 and "," in status_filters[0]:
-        status_filters = [part.strip() for part in status_filters[0].split(",") if part.strip()]
-    status_filters = [value for value in status_filters if value]
-    if not status_filters:
-        status_filters = ["running"]
+    status_filters = _discovery_status_filters(
+        status,
+        str(getattr(settings, "BB_ARENA_CONTAINERS_STATUS", "running") or "running"),
+    )
 
     attempted_urls: List[str] = []
     last_404_error: Optional[str] = None
@@ -296,23 +429,25 @@ async def fetch_live_containers(
             params: Dict[str, Any] = {"window_seconds": req_window_seconds}
             if status_filter:
                 params["status"] = status_filter
-            async with session.get(url, params=params, timeout=ClientTimeout(total=req_timeout)) as response:
-                if response.status == 404:
-                    text = await response.text()
-                    path_missing = True
-                    last_404_error = f"arena miners API failed 404 at {url}: {text[:300]}"
-                    logger.warning("Round2 discovery path not found: %s", url)
-                    break
-                if response.status != 200:
-                    text = await response.text()
-                    raise RuntimeError(f"arena miners API failed {response.status} at {url}: {text[:300]}")
-
-                try:
-                    payload = await response.json()
-                except Exception as exc:
-                    raise RuntimeError(f"arena miners API returned invalid JSON: {exc}") from exc
-
-            if not isinstance(payload, dict):
+            response_status, response_text, payload = await _request_discovery_payload(
+                session,
+                url=url,
+                auth_url=gateway_auth_url,
+                params=params,
+                timeout=req_timeout,
+            )
+            if response_status == 404:
+                path_missing = True
+                last_404_error = (
+                    f"arena miners API failed 404 at {url}: {response_text[:300]}"
+                )
+                logger.warning("Round2 discovery path not found: %s", url)
+                break
+            if response_status != 200:
+                raise RuntimeError(
+                    f"arena miners API failed {response_status} at {url}: {response_text[:300]}"
+                )
+            if payload is None:
                 raise RuntimeError("arena miners API payload must be an object")
 
             rows: list[Dict[str, Any]] = []
@@ -447,6 +582,9 @@ async def resolve_round2_routes(
                 matched_miner.hotkey,
             )
             route.miner_hotkey = matched_miner.hotkey
+
+        if route.miner_uid is None:
+            route.miner_uid = matched_miner.uid
 
         if route.miner_hotkey in hotkey_to_route:
             logger.warning(

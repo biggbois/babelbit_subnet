@@ -28,6 +28,7 @@ MANIFEST
 
 # Virtual environments
 .env
+.env.bak
 .venv
 env/
 venv/
@@ -78,3 +79,4 @@ my_chute.py
 # Test artifacts (persistent for local inspection, safe to ignore)
 test_logs/
 test_scores/
+data/challenge_status/

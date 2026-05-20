@@ -2,44 +2,129 @@
   <img width="265" height="281" alt="Babelbit logo Black" src="https://github.com/user-attachments/assets/055577f8-0ff4-4d67-9153-e66c00688bb2" />
 </p>
 
-## 1: Our Ambition: An Interpreter's Job Cannot be Performed by Translation Software
+[Experienced Bittensor contributors can jump to our detailed subnet instructions](#instructions)
 
-In one sense, Babelbit is a Bittensor subnet developing low-latency predictive translation. However, the goal of our product is to behave like a **human interpreter**, which is a significantly different job from translation.
+# BIG REWARDS FOR CREATING THE BEST AUTOMATED SPEECH INTERPRETER IN THE WORLD
 
-Speech-to-speech translation metrics are focused on making translations faster and more accurate, and usually transform speech into text to achieve this. To get better at this bit by bit, a community like Bittensor probably wouldn't be needed.
+We are already ahead of SOTA on straight speech-to-speech translation but that is not what a human interpreter does. 
 
-So before you get started, we'd like to explain just how different our approach is, and also give you a few strategies for how you might get going. That isn't to say you won't come up with better ones yourselves, but we'd like to make sure that ML experts who haven't worked in this field before don't have to work it all out from scratch.
+## Babelbit: Bittensor SN59: PHASE 2 - Product Development
+For the last six months, since the subnet went live, we have been setting challenges for miners to prove one of the hypotheses which inspired our project to create a simultaneous translation system, capable of outperforming human interpreters. The particular human trait we focused on was prediction. Machine translation focuses on accuracy at the expense of latency, because until the advent of LLMs, neural networks were not that good at prediction. However, all human beings anticipate what is about to be said, when they listen to speech. Our hypothesis - now proven - was that LLMs can be trained for **phrase completion**, i.e. to predict beyond the next-word prediction which is the essential mechanism by which transformer networks generate output. 
+**
+That is, just like a person, can we start translating the phrase "May the Force be with you" after only hearing "May the Force...".**
 
-**See Section 11 at the end of this document**
+Having proved that this is possible, we are now moving into a completely new type of competition. We are providing our current state-of-the art technology and rewarding miners for improving it. Things have been going very well, and our new workflow is something like this:
+1. We come up with a method we think is useful for speech-to-speech translation
+2. We build a prototype which can be integrated into a base script for a incentivised mining process on Bittensor
+3. We run the competition indefinitely until performance is significantly better
+4. We update the base script using selections from the improvements made by miners
+5. We keep going until we are at the maximum possible performance for that particular feature. 
 
-## 2: What is The Orthodox Approach?
+However, there are a **lot** of features. We have developed some serious ambitions by researching what it is that human interpreters do. 
 
-Speech-to-speech translation or simultaneous translation, is usually designed as an extension of the techniques used in text-based translation. The expertise - great though it is - comes from the gold standard in translating books, so it works something like this:
+**Getting Google Translate to run 10x faster would not be a good interpreter**
 
-1. Speech-to-Text
-2. Text-to-Text Translation
-3. Contextual Changes, e.g. replacing an English metaphor with a similar meaning one, like replacing "That's just not cricket" with the German phrase, "Das ist nicht die feine Art". Translating a book and keeping the style, means that a metaphor should be replaced by a metaphor.
-4. Text-to-Speech
+That said, eliminating latency is still a valid goal, as it gives us the bandwidth to do a lot more impressive stuff.
 
-## 3: What is Babelbit's Approach?
-There are **three completely separate techniques** which make Babelbit different from the usual multi-step process. All of these make the user experience better, and all improve latency.
+## The Fallacy of Machine Translation Benchmarks
+The gold standard of machine translation is to create the most accurate literal translation of the input, as fast as possible. However, interpreters do something very different. Human speech can be intrinsically difficult to understand for all kinds of reasons. The first three can help latency, but some of the others are about the most important aspect of the job - imparting **understanding**.
 
-### 3.1: PHRASE PREDICTION
-Anyone familiar with our previous challenges will already know that a big part of our latency strategy, is start translating as soon as the meaning is clear. This means that we haveto train models in a different way. We have to train the models to predict when they can, and not to predict when they can't:
-"May the force be..." can be translated before the English phrase is finished.
-"My favourite poem is..." cannot be translated until hearing the end.
+The normal latency benchmarks take the average delay between words in the input, and equivalent words in the output. We don't translate that way. 
+**
+- FRENCH INPUT: Je pense que vous avez tout à fait raison.
+- GOOGLE: I think you're absolutely right.
+- BABELBIT: Agreed!**
 
-**We hope you'll agree that this is exciting stuff for any machine learning expert. We are not just optimising an off-the-shelf LLM, we are creating new kinds of LLMS.**
+Average word latency is useless. We have devised a new benchmark, which we call:
 
-### 3.2: ONE-SHOT SPEECH-MODE TRANSLATION
-We are already building our base script on a speech-mode language model. That is we are taking a model which tokenises speech, rather than converting it into text, and then training it to generate translations from chunks of meaning comprising tokenised speech in other languages, rather than text.
+**Phrase Completion Latency**. 
 
-**When you add this approach to 3.1 above, it is even more exciting, building an innately predictive model, but with predictions which are chunks of speech, not chunks of text**
+We measure the delay between the end of a phrase in the input, and the point in the output when the meaning has been imparted accurately. 
 
-### 3.3: PARAPHRASING
-**The gold standard of interpretion is not being as literal and accurate as possible**. In section 2 above we included an example where a metaphor was replaced by a metaphor. This is close to an art form for good translators, but can be very confusing for listeners to an interpreter, as sometimes even the translation is not in the listeners native language.
+## The competitions we are lining up for you
+We still want to work on latency, and we have three different approaches to doing that. The first will be very familiar to our existing miners.
 
-Good interpretation is a matter of getting the meaning across in a succinct, polite and culturally sensitive way.
+1. Prediction - reducing latency by anticipating what is about to be said, and translating it early, e.g. "May the force..."
+2. By doing everything in speech mode - by creating a transformer network of tokenised speech, we save time by not converting speech to text, translating the text, and then generating the speech. This is bundled in our architecture, but we are sure that the tokenisation of speech, and the generation of translations from speech tokens can be improved upon.
+3. Paraphrasing - because we can generate the translation from speech tokens, we can include criteria like shortening a wordy sentence, without doing two passes. Legacy tech would translate and then summarise. This is like if you ask ChatGPT to create a English review of a French book. It can understand the French book, and understand how to say what it needs to in English. It would not translate the book.
+
+## Future Features
+Some of these will have their own competitions and sometimes we will run multiple competitions in parallel. Different miners might be interested in different aspects of our product development:
+
+These next ones are all about understanding, but some help with latency as well.
+
+4. Remove repetition
+5. Remove interjections (ums and ahs)
+6. Remove expletives
+7. Expand on ellipses - if words are missed out, they might need to be restored in the target languae
+8. Cultural sensitivities - rewording a sentence which might be offensive to people with certain beliefs
+
+## Grammarly for Speech
+This last one is even more interesting in some ways because it doesn't involve translation at all. We created a demo to show what we mean by paraphrasing etc, which was English-to-English:
+
+https://babelbit.ai/demo
+
+We started getting sales enquiries from people who want to do things like broadcast live interviews with people who have unusual dialects, or have stammers, or are simply nervous, and repeat themselves. Josh, our chief scientist built a working version and we now think that this could be like Grammarly for Speech. 
+
+We have our first sales meeting this week!
+
+**SO YOU CAN SEE - WE NEED THE BEST SPEECH AND LANGUAGE MACHINE LEARNING EXPERTS TO TRAIN OUR NETWORK TO DO ALL THESE THINGS AT ONCE**
+
+Below are the explanations of how the competition works and how to get started, but we are not dogmatic. Most people will probably start with our base script. 
+
+As well as the a prebuilt miner we are giving you access to a bunch of our R&D. 
+
+1. You can use our SOTA model
+2. You can start with a speech mode model like Moshi which has no translation capability
+3. You can play with our R&D experiments which can do various things - check out the folders below
+4. You could build your own from scratch
+
+Links:
+XXXXXXXXXXX
+XXXXXXXXXXX
+
+**Whichever way you do it, if you can improve the performance of our product, you will be handsomely rewarded**
+
+
+# INSTRUCTIONS
+
+## 1: Babelbit's Goal
+
+Babelbit is a Bittensor speech-to-speech subnet focused on low-latency machine interpretation.
+
+The goal is not just to translate correctly. The goal is to behave more like a good human interpreter: understand speech as it arrives, respond quickly, and produce useful target-language speech rather than waiting for a perfect full-utterance transcript.
+
+That difference matters. A conventional speech pipeline can be very accurate and still feel too slow or too literal for live use. Babelbit is built around the idea that latency, delivery style, and spoken usefulness are part of the task, not just post-processing details.
+
+## 2: What Makes The Subnet Different
+
+The current subnet is organized around speech-to-speech behavior rather than a text-first benchmark.
+
+At a high level, miners are being pushed toward systems that can:
+
+1. consume source audio directly
+2. decide when enough meaning is available to begin responding
+3. generate target-language speech with low delay
+4. preserve meaning while still sounding natural and usable in real-time
+
+This does not force one model architecture. A miner might still use text internally, a speech-token model, or a hybrid stack. What matters is the validator-facing behavior and the resulting quality/latency tradeoff.
+
+## 3: What We Mean By "Interpretation"
+
+The gold standard is not word-for-word literalism.
+
+In live interpretation, the best output is often shorter, clearer, and more listener-friendly than a strict translation. Good systems may need to:
+
+1. remove accidental repetition
+2. compress rambling phrasing
+3. replace figurative language with clearer literal meaning
+4. soften gratuitous profanity while preserving intent
+5. choose culturally appropriate phrasing
+
+That is why Babelbit should not be understood as "just another translation benchmark." The user experience depends on whether the model produces good spoken delivery under time pressure.
+
+## 4: Challenge Structure
+
 
 Here are some examples, which will make it clear how different our approach is.
 **NOTE: The best interpreters diverge from precise, literal translations of what is said, as follows:**
@@ -76,101 +161,62 @@ This is a new evolution of our development, and we will need our mining communit
 
 The qualifiers then compete in **The Arena** for a chance at winning the remaining 80%.
 
-## 5: Babelbit Mining Setup
+## 5: Current Validator Stack
 
-This repository is the operator guide and reference implementation for the Babelbit validator stack. It is primarily for:
+This repository is the validator-side operator guide for the Babelbit subnet.
 
-- validators running the validator, runner, signer, and supporting services
-- miners who need the validator-facing compatibility requirements for qualifying and arena participation
+It is primarily for:
 
-Some submission, scoring, and managed deployment workflows are handled by Babelbit-operated services and are intentionally described here only at a high level.
+- validators running `bb runner`, `bb validate`, `bb signer`, and `bb subtensor-gateway`
+- miner operators who need the validator-facing compatibility rules for qualifying and arena participation
 
-`qualifying` is round 1. `arena` is round 2.
+It is not a full miner implementation. Use the miner repository for serving code, model runtime details, and miner-specific tests.
 
-**This repo isn't intended for mining:** Please refer to the [Babelbit Miner repo](https://github.com/babelbit/babelbit_miner) for further instructions on how to run your miner and submit it to the arena.
+### 5.1: What Is Current
 
-### 5.1: What This Repo Covers
+Current validator/runtime behaviour worth knowing up front:
 
-Validators use this repo to:
+- the runner and validator use local files for challenge status and score artifacts
+- the shared status directory is controlled by `BB_CHALLENGE_STATUS_DIR`
+- score outputs are written under `BB_OUTPUT_SCORES_DIR`
+- Postgres-related settings still exist for auxiliary integrations, but they are not the core persistence path for the current scoring loop
+- qualifying discovery still starts from Bittensor axon metadata
 
-- run the validator process
-- run the runner that evaluates miners
-- run the signer service
-- run the subtensor gateway
-- initialise the Postgres schema used for persisted scores
-
-Miners use this repo to:
-
-- understand the validator-facing miner API contract
-- understand request-signing and endpoint compatibility requirements
-- reference shared environment defaults used by the validator stack
-
-Miner participation is not just "run an axon". Miners also need to actively provide:
-
-- a Docker image
-- a Hugging Face repository handle
-
-Those submission artifacts are part of the broader Babelbit participation flow used by Babelbit-operated infrastructure. The private mechanics behind that flow are intentionally not documented here.
+If this repo is split across multiple processes or hosts, `BB_CHALLENGE_STATUS_DIR` must point at shared storage. The Docker setup already mounts a shared volume for that directory.
 
 ### 5.2: Challenge Tiers
 
-The subnet is split into two challenge tiers.
+The subnet currently uses two tiers:
 
-- `Qualifying` receives 20% of the incentive. `Qualifying` miners are rewarded in proportion to their scores.
-- `Arena` receives 80% of the incentive. `Arena` is winner-takes-all.
+- `qualifying`: proportional rewards across qualifying miners
+- `arena`: winner-takes-all for the arena slot
 
-Arena participation is restricted to the best-performing miners from qualifying.
+Arena eligibility is derived from recent qualifying performance. The exact selection mechanics can evolve, so treat the live validator behavior as authoritative.
 
-- A miner must have won at least one qualifying challenge in the last 7 days to be arena-eligible.
-- The 7-day check uses a rolling window (i.e. 7x24 hours).
-- There are currently 7 arena eligibility slots (this number may increase in the future as we continue to evolve).
-- Slots are ordered by number of wins and then by score.
-- The arena winner spot is awarded on a per challenge basis (this may also evolve in the future to a longer winner's place standing). 
-
-### 5.3: How Participation Works
-
-At a high level, the subnet works like this:
-
-1. Validators retrieve the active challenge and evaluate miners.
-2. Qualifying miners are discovered through Bittensor axon metadata.
-3. Miners also provide a Docker image and a Hugging Face repository handle for Babelbit-managed participation flows.
-4. Validator outputs are submitted to Babelbit-operated services for score aggregation.
-5. Arena selection is based on recent qualifying performance and win history.
-6. Arena rewards are determined from the current winning position.
-
-
-## 6: Babelbit Validator Setup
+## 6: Validator Setup
 
 ### 6.1: Prerequisites
 
-- A Bittensor wallet and hotkey
-- Python 3.10-3.13 if running locally
-- Docker if using the recommended deployment path
-- (Optional) S3-compatible object storage for logs/artifacts and Postgres database
+- a Bittensor wallet and hotkey
+- Python `3.10`-`3.13` for local runs
+- Docker for the recommended deployment path
+- optional object storage for logs/artifacts
 
-### 6.2: Install `btcli`
+### 6.2: Install The Tooling
 
 ```bash
 pip install bittensor-cli
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv
+source .venv/bin/activate
+uv sync
 ```
 
-### 6.3: Create a wallet
+The CLI entrypoint is `bb`.
 
-Create a coldkey:
+### 6.3: Required Environment
 
-```bash
-btcli wallet new_coldkey --n_words 24 --wallet.name my-wallet
-```
-
-Create a hotkey:
-
-```bash
-btcli wallet new_hotkey --wallet.name my-wallet --n_words 24 --wallet.hotkey my-hotkey
-```
-
-### 6.4: Required validator environment
-
-Set the required wallet, network, service, and database settings in `.env`:
+Start from [`env.example`](./env.example). The minimum validator settings are:
 
 ```bash
 BITTENSOR_WALLET_PATH=~/.bittensor/wallets/my-wallet/hotkeys/my-hotkey
@@ -186,73 +232,20 @@ SUBTENSOR_GATEWAY_URL=http://127.0.0.1:8090
 BB_UTTERANCE_ENGINE_URL=https://api.babelbit.ai/
 BB_SUBMIT_API_URL=https://scoring.babelbit.ai/
 BB_ARENA_GATEWAY_URL=https://gw.babelbit.ai/
-BB_SUBMIT_TIMEOUT_S=30
-BB_MINER_TIMEOUT_SEC=10
+
+BB_CHALLENGE_STATUS_DIR=data/challenge_status
+BB_OUTPUT_LOGS_DIR=logs
+BB_OUTPUT_SCORES_DIR=scores
 ```
 
-### 6.5: Optional validator settings
+### 6.4: Main Commands
 
-Optional Postgres and S3-compatible storage:
-
-```bash
-PG_HOST=your-pg-host
-PG_PORT=your-pg-port
-PG_DB=your-pg-db-name
-PG_USER=your-pg-user
-PG_PASSWORD=your-pg-password
-
-BB_ENABLE_S3_UPLOADS=1
-S3_ENDPOINT_URL=your-s3-endpoint-url
-S3_REGION=s3-region
-S3_ACCESS_KEY_ID=your-s3-access-key
-S3_SECRET_ACCESS_KEY=your-s3-secret
-S3_BUCKET_NAME=your-s3-bucket
-S3_SUBMISSIONS_DIR=challenges
-S3_LOG_DIR=logs
-S3_ADDRESSING_STYLE=path
-S3_SIGNATURE_VERSION=s3v4
-S3_USE_SSL=true
-```
-
-Additional runner, arena, metrics, and scoring settings are available in [`env.example`](./env.example).
-
-### 6.6: Initialize Postgres (Optional)
-
-Initialize the database schema:
-
-```bash
-psql -h YOUR_PG_HOST -p YOUR_PG_PORT -U YOUR_PG_USER -d YOUR_PG_DB -f sql/init.sql
-```
-
-### 6.7: Local setup
-
-If you want to run outside Docker:
-
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv
-source .venv/bin/activate
-uv sync
-```
-
-The CLI entrypoint is:
-
-```bash
-bb
-```
-
-### 6.8: Validator services
-
-The main validator-side commands are:
-
-- `bb runner`: evaluates miners on the active challenge cadence
+- `bb runner`: executes the qualifying, solo, and arena runner flows
 - `bb validate`: calculates and submits weights
-- `bb signer`: runs the signing service used by validator components
-- `bb subtensor-gateway`: runs the gateway used by the validator stack
+- `bb signer`: runs the local signing service
+- `bb subtensor-gateway`: runs the local subtensor gateway
 
-### 6.9: Recommended validator deployment
-
-Run the validator stack with Docker:
+### 6.5: Recommended Deployment
 
 ```bash
 docker compose down
@@ -261,15 +254,7 @@ docker compose up --build -d
 docker compose logs -f --tail 100
 ```
 
-### 6.10: Local validator run
-
-If running locally, make sure the signer URL points to a reachable local signer:
-
-```bash
-SIGNER_URL=http://127.0.0.1:8080
-```
-
-Then run the services you need:
+### 6.6: Local Run
 
 ```bash
 bb -vv signer
@@ -278,158 +263,179 @@ bb -vv runner
 bb -vv validate
 ```
 
-## 7: Miner Setup
+## 7: Validator Gotchas
 
-### 7.1: Scope
+These were easy to miss in the older docs and are now explicit:
 
-The actual miner implementation lives in an external repository or private codebase. This repository does not currently ship a runnable miner package.
+- utterance-engine auth is mandatory in normal operation; runner startup authenticates against the engine and will fail early if that path is broken
+- `BB_ENABLE_SOLO_CHALLENGE=1` is the current default, so a solo phase may run in addition to the main qualifying flow
+- `BB_ENABLE_ARENA_CHALLENGE` gates the arena phase independently of qualifying
+- runner dedupe is file-based: if score files already exist for a challenge/type, the runner skips reprocessing that challenge
+- arena-managed health checks expect `GET /health`, not `GET /healthz`
+- Hugging Face accessibility matters for committed-model flows; gated or inaccessible revisions can be filtered out even if the miner is otherwise reachable
 
-Use your miner repo for:
+### 7.1: Postgres Note (Optional)
 
-- process entrypoints
-- axon registration scripts
-- miner-specific tests
-- model-specific decoding and serving configuration
+`sql/init.sql` is not a generic public bootstrap script. It contains owner-specific assumptions and should be adapted before use in a fresh external environment.
 
-Use this repo for the validator-facing requirements your miner must satisfy.
+## 8: Miner Participation
 
-### 7.2: What miners need to do
+### 8.1: Qualifying vs Managed Submission
 
-Miners participating in Babelbit need to maintain two things:
+There are two distinct surfaces miners should understand:
 
-1. A reachable qualifying miner that validators can discover through Bittensor axon metadata.
-2. Submission artifacts for the broader Babelbit flow: a Docker image and a Hugging Face repository handle.
+1. Qualifying discovery
+2. Managed submission and arena participation
 
-This repo documents the public compatibility requirements. Private submission and managed deployment mechanics are intentionally omitted.
+For qualifying discovery, a miner can still be discovered from valid Bittensor axon metadata alone.
 
-### 7.3: Prerequisites
+For managed submission flows, miners should also maintain:
 
-- Python 3.10-3.13
-- Enough RAM or VRAM for the chosen model
-- A Bittensor wallet and registered hotkey
-- A reachable public IP and port for your axon-compatible miner
-- Hugging Face access if your model is gated or private
+- a Docker image for the submitted runtime
+- a Hugging Face repository handle for the submitted model
 
-### 7.4: Shared miner-related environment
+Those managed-flow mechanics are intentionally only described at a high level here.
 
-The validator stack and related tooling currently reference these shared miner-related settings:
+### 8.2: Validator-Facing Expectations
 
-```bash
-BITTENSOR_WALLET_PATH=~/.bittensor/wallets/my-wallet/hotkeys/my-hotkey
-BITTENSOR_WALLET_COLD=my-wallet
-BITTENSOR_WALLET_HOT=my-hotkey
-BITTENSOR_SUBTENSOR_ENDPOINT=finney
-BABELBIT_NETUID=59
+The validator currently expects miners to:
 
-HUGGINGFACE_USERNAME=your-username
-HUGGINGFACE_API_KEY=your-api-key
+- register on netuid `59`
+- publish reachable axon IP/port metadata
+- accept Bittensor-style signed request headers
+- expose a prediction path compatible with the active miner contract used by the validator
 
-MINER_MODEL_ID=babelbit-ai/base-miner
-MINER_AXON_PORT=8091
-MINER_DEVICE=cpu
-MINER_LOAD_IN_8BIT=0
-MINER_LOAD_IN_4BIT=0
+The concrete request and response schema should be taken from the current miner repository and validator tests, not from older examples that assumed a text-completion-only flow.
 
-# Optional
-# MINER_MODEL_REVISION=main
-# MINER_EXTERNAL_IP=your-public-ip
-```
+### 8.3: Local Compatibility Testing
 
-Model-specific generation knobs belong in the external miner repo, not in this validator stack.
-
-### 7.5: Register on the subnet
-
-Register your hotkey on the subnet:
-
-```bash
-btcli subnet register --wallet.name my-wallet --wallet.hotkey my-hotkey --netuid 59
-```
-
-### 7.6: Publish axon metadata
-
-Register your axon metadata with whichever tool your miner repo provides. Validators discover qualifying miners from Bittensor axon metadata, so the published IP and port must match the miner endpoint you actually expose.
-
-If your miner is reachable through a different public IP than the host can infer automatically, publish that explicit external IP and port in your axon metadata.
-
-### 7.7: Compatibility requirements
-
-Your external miner implementation should satisfy these validator-facing expectations:
-
-- Register on netuid `59` with a hotkey that is discoverable through Bittensor axon metadata.
-- Expose a prediction endpoint at `POST /predict` by default. Validators can be pointed at a different path with `BB_MINER_PREDICT_ENDPOINT`, but `/predict` is the current default.
-- Optionally expose `GET /healthz` for operational monitoring.
-- Accept Bittensor-style signed request headers. The validator currently sends `bt_header_*` headers such as hotkey, nonce, UUID, signature, axon IP, and axon port.
-- Return JSON compatible with the validator schema: `success`, `model`, `utterance`, `context_used`, optional `error`, and `complete`.
-
-### 7.8: Local compatibility testing
-
-If the validator runs in Docker and your miner runs on the host machine, enable validator dev routing so `127.0.0.1` style axon addresses can be translated correctly:
+If the validator runs in Docker and your miner runs on the host, enable local routing:
 
 ```bash
 BB_DEV_MODE=1
 BB_LOCAL_MINER_IP=127.0.0.1
 ```
 
-Run the concrete miner tests from the external miner repository you are using.
+Then run the miner-side tests from the miner repository you are actually using.
 
-## 8: Miner Submission Artifacts
+## 9: Scoring Mechanism
 
-Running a qualifying miner is only one part of participation.
+The validator scores the audio a miner returns. It does not ask the miner for a transcript and trust it.
 
-Miners should also maintain:
+The scoring model has three main questions:
 
-- a Docker image for their submitted runtime
-- a Hugging Face repository handle for the submitted model
+1. Did the miner say the right thing?
+2. Did the miner speak at a believable speed?
+3. Did the miner finish quickly enough?
 
-These artifacts are used by Babelbit-managed participation flows. This README does not document the private operational details behind those systems, but miners should treat the container image and Hugging Face repo as part of their production submission surface.
+The first two are gates. If the audio is not close enough to the reference, or if the speaking rate is clearly wrong, the utterance gets `0`. If it passes those gates, the score is based on latency.
 
-## 9: Performance Notes
+### 9.1: What The Validator Compares Against
 
-### 9.1: CPU and Mac usage
+Each utterance has reference data: the expected target-language text, and usually enough word timing or words-per-second information to know how fast the reference speech should be.
 
-- Small models are suitable for CPU testing.
-- Large models on CPU will usually be too slow for competitive inference.
-- Apple Silicon MPS can work for some models, but compatibility varies.
+That reference data can come directly from the utterance engine response, or from files under `BB_AUDIO_SCORING_METADATA_ROOT`. The score output records where it came from in `scoring_metadata_source`.
 
-### 9.2: GPU usage
+### 9.2: Turning Miner Audio Into Text
 
-- Set `MINER_DEVICE=cuda` on NVIDIA systems.
-- Use quantization if you need to reduce VRAM pressure.
+The miner returns audio, so the validator first transcribes that audio with its own STT model. This keeps the scoring path honest: a miner cannot claim it said one thing while returning different audio.
 
-### 9.3: Quantization
+Current defaults:
 
-- `MINER_LOAD_IN_8BIT=1` can reduce memory use.
-- `MINER_LOAD_IN_4BIT=1` can reduce memory use further.
+- `BB_AUDIO_SCORING_STT_MODEL=faster-whisper-small`
+- `BB_AUDIO_SCORING_STT_DEVICE=cpu`
+- `BB_AUDIO_SCORING_STT_CACHE_PATH=~/.babelbit/audio_scoring/stt_cache.jsonl`
+
+The STT step produces two things the scorer uses:
+
+- transcript text, used to check meaning
+- word timestamps, used to estimate speaking rate
+
+Repeated audio is cached by WAV hash. On CPU, faster-whisper runs the default `float16` model setting as `int8`. In practice, this transcription step is the slow part of scoring on CPU-only validators.
+
+### 9.3: Meaning Check
+
+Once the validator has a transcript, it compares that transcript to the reference text using sentence embeddings.
+
+This is intentionally not exact string matching. A good interpretation may use different words while preserving the same meaning. The embedding comparison gives an `accuracy` score from `0` to `1`.
+
+Current default embedder:
+
+- `BB_AUDIO_SCORING_EMBEDDER=sentence-transformers/all-MiniLM-L6-v2`
+
+By default, an utterance needs `accuracy >= 0.65` to be eligible for a non-zero score.
+
+### 9.4: Speaking-Rate Check
+
+The scorer also checks whether the returned audio sounds like plausible speech rather than being wildly too fast or too slow.
+
+It estimates the miner's words per second from the STT word timestamps, then compares that against the reference speaking rate.
+
+Current defaults:
+
+- `BB_AUDIO_SCORING_RATE_LOWER=0.3`
+- `BB_AUDIO_SCORING_RATE_UPPER=1.3`
+
+So if the miner is speaking at less than `0.3x` or more than `1.3x` the reference rate, the utterance fails this gate and scores `0`.
+
+### 9.5: Latency Check
+
+For audio that passes the meaning and speaking-rate gates, latency decides the score.
+
+The scorer looks at when the miner started returning audio and how long that audio lasted. From that it computes when the miner effectively finished. Finishing before or at the source utterance end gets a latency score of `1.0`.
+
+Some delay is allowed. The allowed delay is based on the source utterance length:
+
+- default allowance is `30%` of source duration
+- allowance is never less than `2s`
+- allowance is never more than `10s`
+
+Inside that window, the score falls smoothly from `1.0` toward `0.0`. Once the miner is later than the allowed window, latency score is `0.0`.
+
+### 9.6: Final Utterance Score
+
+The default scoring rule is:
+
+```text
+if meaning passes and speaking rate passes:
+    score = latency_score
+else:
+    score = 0
+```
+
+This means the current validator does not give partial credit for being fast but wrong. A miner first has to produce audio that is close enough in meaning and plausible as speech. After that, lower latency wins.
+
+### 9.7: Challenge Score
+
+The runner scores each miner on each utterance, then averages that miner's utterance scores into a challenge score.
+
+So if a challenge has several utterances, one bad utterance hurts the average, but it does not automatically erase the whole challenge unless every utterance scores badly.
+
+### 9.8: Failures
+
+If scoring cannot complete for an utterance, that utterance gets `0`.
+
+Common causes are:
+
+- STT failed
+- the returned audio produced an empty transcript
+- reference metadata was missing or malformed
+
+These failures are marked with `score_method = semantic_audio_v1_error` and a `score_error` string.
+
+### 9.9: Performance
+
+On CPU-only validators, STT is the main cost.
+
+With the current defaults, `tests/benchmarks/stress_stt.py` measured about `1402s` of wall time for a synthetic `250 miners x 60s` workload on an `8 vCPU / 16 GB RAM` DigitalOcean Premium AMD VM. A smaller `4 vCPU / 8 GB RAM` DigitalOcean Regular Intel VM was materially slower and would push the same workload into hour-scale runtime.
+
+See [`min_compute.yml`](./min_compute.yml) for the current benchmark-based floor.
 
 ## 10: Troubleshooting
 
-### 10.1: "Torch not compiled with CUDA enabled"
-
-Use:
-
-```bash
-MINER_DEVICE=cpu
-```
-
-### 10.2: MPS-related failures on Apple Silicon
-
-If MPS is unstable for your model, switch to CPU:
-
-```bash
-MINER_DEVICE=cpu
-```
-
-### 10.3: Prediction timeouts
-
-- Your model may be too large for the hardware.
-- Reduce model size or enable quantization.
-- Test with a smaller model first to confirm the serving path works.
-
-### 10.4: Hugging Face download failures
-
-- Check that the model ID is correct.
-- Make sure your Hugging Face token has access if the model is gated.
-- Confirm the target revision exists if using `MINER_MODEL_REVISION`.
+- If the runner appears to skip work unexpectedly, inspect existing files under `BB_OUTPUT_SCORES_DIR` and `BB_CHALLENGE_STATUS_DIR` first.
+- If arena health checks fail while the miner otherwise looks healthy, confirm that the managed endpoint serves `GET /health`.
+- If a committed or managed miner is not being considered, verify that its published or submitted Hugging Face revision is readable from the validator environment.
 
 ## 11: What would we Try if we were miners?
 
@@ -484,4 +490,3 @@ This is the cheapest experiment to run, and a good starting point before committ
 
 - **3: Full Training from Scratch**:
 Starting from an uninitialised model and training end-to-end on the speech-to-speech task (as in Google's Translatotron lineage), or on a hybrid objective that conditions on LM-generated "inner monologue" text (closer to the Hibiki approach). This give you the most architectural freedom.
-

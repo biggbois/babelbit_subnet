@@ -1,6 +1,15 @@
-"""Scoring utilities shared by runner tests and CLI helpers."""
+"""Audio scoring utilities shared by runner tests and CLI helpers."""
 
-# Re-export score_jsonl for compatibility with existing imports.
-from .score_dialogue import score_jsonl  # noqa: F401
+from .reference_metadata import resolve_audio_reference_metadata  # noqa: F401
+from .utterance_scoring import (  # noqa: F401
+    SEMANTIC_AUDIO_SCORING_MODE,
+    score_audio_utterance_batch,
+    score_audio_utterance_bytes,
+)
 
-__all__ = ["score_jsonl"]
+__all__ = [
+    "SEMANTIC_AUDIO_SCORING_MODE",
+    "resolve_audio_reference_metadata",
+    "score_audio_utterance_batch",
+    "score_audio_utterance_bytes",
+]

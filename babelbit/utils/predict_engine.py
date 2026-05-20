@@ -1,10 +1,12 @@
 from json import dumps, loads
+import hashlib
 from logging import getLogger
+from os import getenv
 from time import monotonic
+import asyncio
 import time
 from threading import Lock
 import uuid
-import asyncio
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -12,7 +14,10 @@ from asyncio import TimeoutError
 from aiohttp import ClientTimeout
 from bittensor.utils import networking
 
-from babelbit.schemas.prediction import BBPredictedUtterance, BBPredictOutput
+from babelbit.schemas.audio_prediction import (
+    BBAudioMinerInitPayload,
+    BBAudioMinerPredictPayload,
+)
 from babelbit.utils.async_clients import get_async_client
 from babelbit.utils.bittensor_helpers import load_hotkey_keypair
 from babelbit.utils.settings import get_settings
@@ -21,13 +26,129 @@ logger = getLogger(__name__)
 
 _VALIDATOR_IDENTITY_CACHE = None
 _GATEWAY_AUTH_TOKEN_CACHE: dict[str, tuple[str, float]] = {}
-_GATEWAY_AUTH_TOKEN_INFLIGHT: dict[str, asyncio.Future[tuple[str, int, str]]] = {}
 _GATEWAY_AUTH_TOKEN_LOCK = Lock()
 _GATEWAY_AUTH_TOKEN_TTL_FALLBACK_S = 1800
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_path(name: str, default: str) -> str:
+    value = str(getenv(name, default) or default).strip()
+    if not value.startswith("/"):
+        value = f"/{value}"
+    return value
+
+
+def _gateway_retry_delay_seconds(attempt: int) -> float:
+    base = _env_float("BB_ARENA_GATEWAY_RETRY_BASE_DELAY_SEC", 2.0)
+    cap = _env_float("BB_ARENA_GATEWAY_RETRY_MAX_DELAY_SEC", 10.0)
+    return max(0.1, min(cap, base * (2 ** max(0, attempt))))
+
+
+def _is_retryable_gateway_error(status: int, body: str) -> bool:
+    if status in {404, 429, 503, 504}:
+        return True
+    text = str(body or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "endpoint_not_found",
+            "pod_capacity_exhausted",
+            "pod_recreating",
+            "miner pod is being recreated",
+            "cold pod could not be started",
+            "warming",
+            "rate_limited",
+            "upstream_unavailable",
+        )
+    )
+
+
+def _build_url(base_url: str, path: str) -> str:
+    normalized_base = str(base_url or "").strip().rstrip("/")
+    normalized_path = str(path or "").strip()
+    if not normalized_path.startswith("/"):
+        normalized_path = f"/{normalized_path}"
+    return f"{normalized_base}{normalized_path}"
+
+
+def _is_active_pod_status(status: str | None) -> bool:
+    return str(status or "").strip().lower() in {"running", "warming", "idle"}
+
+
+async def _start_runpod_pod(*, endpoint_id: str, runpod_api_key: str, timeout: float) -> None:
+    session = await get_async_client()
+    async with session.post(
+        f"https://rest.runpod.io/v1/pods/{endpoint_id}/start",
+        headers={"Authorization": f"Bearer {runpod_api_key}"},
+        timeout=ClientTimeout(total=max(timeout, 10.0)),
+    ) as response:
+        if response.status not in {200, 201}:
+            text = await response.text()
+            raise RuntimeError(f"RunPod pod start failed: status={response.status} body={text[:300]}")
+
+
+async def _wait_for_managed_pod_health(*, base_url: str, timeout: float) -> None:
+    session = await get_async_client()
+    deadline = monotonic() + max(1.0, timeout)
+    last_error = ""
+
+    while monotonic() < deadline:
+        for path in (_env_path("POD_HEALTH_PATH", "/healthz"), "/health"):
+            try:
+                async with session.get(
+                    _build_url(base_url, path),
+                    timeout=ClientTimeout(total=min(max(timeout, 1.0), 10.0)),
+                ) as response:
+                    if response.status == 200:
+                        return
+                    last_error = f"status={response.status} path={path}"
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}:{exc}"
+        await asyncio.sleep(max(0.2, _env_float("POD_WAKE_POLL_INTERVAL_SECONDS", 2.0)))
+
+    raise RuntimeError(f"RunPod pod health check timed out: {last_error or 'unknown'}")
+
+
+def _build_bt_predict_headers(
+    *,
+    validator_identity: dict[str, Any],
+    miner_hotkey: str,
+    axon_ip: str,
+    axon_port: str,
+    timeout: float,
+    payload: BBAudioMinerInitPayload | BBAudioMinerPredictPayload,
+) -> dict[str, str]:
+    nonce = time.time_ns()
+    body_hash = ""
+    message = (
+        f"{nonce}.{validator_identity['hotkey']}."
+        f"{miner_hotkey}.{validator_identity['uuid']}.{body_hash}"
+    )
+    signature = f"0x{validator_identity['keypair'].sign(message).hex()}"
+    return {
+        "Content-Type": "application/json",
+        "bt_header_dendrite_nonce": str(nonce),
+        "bt_header_dendrite_hotkey": validator_identity["hotkey"],
+        "bt_header_dendrite_signature": signature,
+        "bt_header_dendrite_uuid": validator_identity["uuid"],
+        "bt_header_dendrite_ip": validator_identity["external_ip"],
+        "bt_header_dendrite_version": "7002000",
+        "bt_header_axon_hotkey": miner_hotkey,
+        "bt_header_axon_ip": axon_ip,
+        "bt_header_axon_port": str(axon_port),
+        "timeout": str(timeout),
+        "name": type(payload).__name__,
+        "computed_body_hash": body_hash,
+    }
+
+
 def _normalize_managed_predict_url(endpoint_url: str, predict_endpoint: str) -> str:
-    """Normalize managed container base URL to a concrete predict URL."""
     url = (endpoint_url or "").strip()
     if not url:
         return ""
@@ -42,7 +163,6 @@ def _normalize_managed_predict_url(endpoint_url: str, predict_endpoint: str) -> 
     parsed = urlparse(url)
     path = parsed.path or ""
 
-    # Targon rows commonly expose the service base URL; Round2 must POST to /predict.
     normalized_path = path.rstrip("/")
     if not normalized_path:
         normalized_path = f"/{endpoint}"
@@ -50,27 +170,6 @@ def _normalize_managed_predict_url(endpoint_url: str, predict_endpoint: str) -> 
         normalized_path = f"{normalized_path}/{endpoint}"
 
     return urlunparse(parsed._replace(path=normalized_path))
-
-
-def _extract_prediction_from_provider_payload(payload: Any) -> str:
-    if isinstance(payload, dict):
-        prediction = payload.get("prediction")
-        if isinstance(prediction, str):
-            return prediction
-
-        output = payload.get("output")
-        if isinstance(output, str):
-            return output
-        if isinstance(output, dict):
-            nested_prediction = output.get("prediction")
-            if isinstance(nested_prediction, str):
-                return nested_prediction
-            deep_output = output.get("output")
-            if isinstance(deep_output, dict):
-                deep_prediction = deep_output.get("prediction")
-                if isinstance(deep_prediction, str):
-                    return deep_prediction
-    return ""
 
 
 def _normalize_gateway_runsync_url(endpoint_url: str) -> str:
@@ -82,7 +181,9 @@ def _normalize_gateway_runsync_url(endpoint_url: str) -> str:
     return url
 
 
-def _derive_gateway_auth_url(gateway_runsync_url: str, auth_path: str, runsync_path: str) -> str:
+def _derive_gateway_auth_url(
+    gateway_runsync_url: str, auth_path: str, runsync_path: str
+) -> str:
     normalized_runsync_url = _normalize_gateway_runsync_url(gateway_runsync_url)
     if not normalized_runsync_url:
         return ""
@@ -102,7 +203,7 @@ def _derive_gateway_auth_url(gateway_runsync_url: str, auth_path: str, runsync_p
         base_path = current_path[: -len(normalized_runsync_path)]
         target_path = f"{base_path}{normalized_auth_path}"
     elif current_path.endswith("/runsync"):
-        target_path = f"{current_path[:-len('/runsync')]}{normalized_auth_path}"
+        target_path = f"{current_path[: -len('/runsync')]}{normalized_auth_path}"
     else:
         target_path = normalized_auth_path
 
@@ -113,8 +214,10 @@ def _gateway_auth_cache_key(
     *,
     auth_url: str,
     validator_hotkey: str,
+    miner_hotkey: str,
+    miner_uid: int,
 ) -> str:
-    return f"{auth_url}|{validator_hotkey}"
+    return f"{auth_url}|{validator_hotkey}|{miner_hotkey}|{miner_uid}"
 
 
 def _get_cached_gateway_auth_token(cache_key: str) -> str:
@@ -141,58 +244,6 @@ def _clear_gateway_auth_token(cache_key: str) -> None:
         _GATEWAY_AUTH_TOKEN_CACHE.pop(cache_key, None)
 
 
-async def _get_or_request_gateway_auth_token(
-    *,
-    cache_key: str,
-    auth_url: str,
-    validator_identity: dict[str, Any],
-    miner_hotkey: str,
-    miner_uid: int,
-    timeout: float,
-) -> tuple[str, int, str]:
-    now = time.time()
-    future: asyncio.Future[tuple[str, int, str]] | None = None
-    created_future = False
-
-    with _GATEWAY_AUTH_TOKEN_LOCK:
-        cached = _GATEWAY_AUTH_TOKEN_CACHE.get(cache_key)
-        if cached:
-            token, expires_at = cached
-            if expires_at > now:
-                return token, max(0, int(expires_at - now)), ""
-            _GATEWAY_AUTH_TOKEN_CACHE.pop(cache_key, None)
-
-        future = _GATEWAY_AUTH_TOKEN_INFLIGHT.get(cache_key)
-        if future is None:
-            future = asyncio.get_running_loop().create_future()
-            _GATEWAY_AUTH_TOKEN_INFLIGHT[cache_key] = future
-            created_future = True
-
-    if not created_future:
-        return await future
-
-    try:
-        token, expires_in, auth_error = await _request_gateway_auth_token(
-            auth_url=auth_url,
-            validator_identity=validator_identity,
-            miner_hotkey=miner_hotkey,
-            miner_uid=miner_uid,
-            timeout=timeout,
-        )
-        if token:
-            _store_gateway_auth_token(cache_key, token, expires_in)
-        future.set_result((token, expires_in, auth_error))
-        return token, expires_in, auth_error
-    except Exception as exc:
-        future.set_exception(exc)
-        raise
-    finally:
-        with _GATEWAY_AUTH_TOKEN_LOCK:
-            current = _GATEWAY_AUTH_TOKEN_INFLIGHT.get(cache_key)
-            if current is future:
-                _GATEWAY_AUTH_TOKEN_INFLIGHT.pop(cache_key, None)
-
-
 async def _request_gateway_auth_token(
     *,
     auth_url: str,
@@ -202,10 +253,7 @@ async def _request_gateway_auth_token(
     timeout: float,
 ) -> tuple[str, int, str]:
     session = await get_async_client()
-    request_specs: list[tuple[dict[str, Any], dict[str, Any]]] = [
-        # Newer gateway contract:
-        # - body requires hotkey + miner_hotkey + uid
-        # - signature canonical input is {"miner_hotkey", "uid"}
+    request_specs = [
         {
             "miner_hotkey": miner_hotkey,
             "uid": miner_uid,
@@ -215,9 +263,6 @@ async def _request_gateway_auth_token(
             "miner_hotkey": miner_hotkey,
             "uid": miner_uid,
         },
-        # Legacy gateway contract:
-        # - body requires hotkey only
-        # - signature canonical input is {"scope":"gateway"}
         {
             "scope": "gateway",
         },
@@ -233,7 +278,9 @@ async def _request_gateway_auth_token(
         timestamp_ms = int(time.time() * 1000)
         nonce = str(time.time_ns())
         gateway_message = f"{timestamp_ms}|{nonce}|{dumps(auth_input_payload, separators=(',', ':'), sort_keys=True)}"
-        raw_signature = validator_identity["keypair"].sign(gateway_message.encode("utf-8"))
+        raw_signature = validator_identity["keypair"].sign(
+            gateway_message.encode("utf-8")
+        )
         if isinstance(raw_signature, (bytes, bytearray)):
             signature_hex = raw_signature.hex()
         else:
@@ -257,7 +304,6 @@ async def _request_gateway_auth_token(
             text = await response.text()
             if response.status != 200:
                 last_error = f"status={response.status} body={text[:300]}"
-                # Try legacy auth schema/signature if the first attempt fails.
                 if idx == 0:
                     continue
                 return "", 0, last_error
@@ -291,8 +337,6 @@ async def _request_gateway_auth_token(
 
 
 def _get_validator_identity():
-    """Get or cache validator identity information used for Axon requests."""
-
     global _VALIDATOR_IDENTITY_CACHE
     if _VALIDATOR_IDENTITY_CACHE is None:
         settings = get_settings()
@@ -306,20 +350,19 @@ def _get_validator_identity():
             "external_ip": networking.get_external_ip(),
             "uuid": str(uuid.uuid4()),
         }
-        logger.info("Validator identity initialized: hotkey=%s...", keypair.ss58_address[:8])
+        logger.info(
+            "Validator identity initialized: hotkey=%s...", keypair.ss58_address[:8]
+        )
     return _VALIDATOR_IDENTITY_CACHE
 
 
-async def call_miner_axon_endpoint(
+async def call_miner_axon_audio_endpoint(
     axon_ip: str,
     axon_port: int,
-    payload: BBPredictedUtterance,
-    context_used: str,
+    payload: BBAudioMinerInitPayload | BBAudioMinerPredictPayload,
     miner_hotkey: str,
     timeout: Optional[float] = None,
-) -> BBPredictOutput:
-    """Call a miner's axon endpoint directly for utterance prediction."""
-
+) -> dict[str, Any]:
     settings = get_settings()
     if timeout is None:
         timeout = float(getattr(settings, "BB_MINER_TIMEOUT_SEC", 10))
@@ -327,20 +370,17 @@ async def call_miner_axon_endpoint(
     try:
         validator_identity = _get_validator_identity()
     except Exception as e:
-        return BBPredictOutput(
-            success=False,
-            model="axon",
-            utterance=payload,
-            error=f"validator_identity_error:{e}",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"validator_identity_error:{e}"}
 
     try:
         if getattr(settings, "BB_DEV_MODE", False):
             local_ip = getattr(settings, "BB_LOCAL_MINER_IP", "") or None
-            if axon_ip in ("127.0.0.1", "localhost", "0.0.0.0") or (local_ip and axon_ip == local_ip):
-                logger.info("Dev mode: translating axon IP %s -> host.docker.internal", axon_ip)
+            if axon_ip in ("127.0.0.1", "localhost", "0.0.0.0") or (
+                local_ip and axon_ip == local_ip
+            ):
+                logger.info(
+                    "Dev mode: translating axon IP %s -> host.docker.internal", axon_ip
+                )
                 axon_ip = "host.docker.internal"
     except Exception:
         pass
@@ -355,7 +395,6 @@ async def call_miner_axon_endpoint(
         f"{miner_hotkey}.{validator_identity['uuid']}.{body_hash}"
     )
     signature = f"0x{validator_identity['keypair'].sign(message).hex()}"
-
     headers = {
         "Content-Type": "application/json",
         "bt_header_dendrite_nonce": str(nonce),
@@ -368,11 +407,10 @@ async def call_miner_axon_endpoint(
         "bt_header_axon_ip": axon_ip,
         "bt_header_axon_port": str(axon_port),
         "timeout": str(timeout),
-        "name": "BBPredictedUtterance",
+        "name": type(payload).__name__,
         "computed_body_hash": body_hash,
     }
 
-    t0 = monotonic()
     try:
         async with session.post(
             url,
@@ -383,250 +421,153 @@ async def call_miner_axon_endpoint(
             text = await response.text()
             if response.status != 200:
                 logger.debug(
-                    "Axon non-200: status=%s body='%s' url=%s miner_hk=%s",
+                    "Axon audio non-200: status=%s body='%s' url=%s miner_hk=%s",
                     response.status,
                     text[:200],
                     url,
                     (miner_hotkey[:16] + "...") if miner_hotkey else "?",
                 )
-                return BBPredictOutput(
-                    success=False,
-                    model="axon",
-                    utterance=payload,
-                    error=f"{response.status}:{text[:300]}",
-                    context_used=context_used,
-                    complete=False,
-                )
-
+                return {"error": f"{response.status}:{text[:300]}"}
             try:
                 data = loads(text)
             except Exception as e:
-                return BBPredictOutput(
-                    success=False,
-                    model="axon",
-                    utterance=payload,
-                    error=f"parse:{e}",
-                    context_used=context_used,
-                    complete=False,
-                )
-
-            prediction = data.get("prediction", "") if isinstance(data, dict) else ""
-            return BBPredictOutput(
-                success=True,
-                model="axon",
-                utterance=BBPredictedUtterance(
-                    index=payload.index,
-                    step=payload.step,
-                    prefix=payload.prefix,
-                    prediction=prediction,
-                    context=context_used,
-                ),
-                error=None,
-                context_used=context_used,
-                complete=True,
-            )
-
+                return {"error": f"parse:{e}"}
+            if isinstance(data, dict):
+                return data
+            return {"error": "invalid_payload_type"}
     except TimeoutError:
-        logger.debug(
-            "Axon timeout: url=%s miner_hk=%s timeout=%.2fs elapsed=%.2fs",
-            url,
-            (miner_hotkey[:16] + "...") if miner_hotkey else "?",
-            timeout,
-            monotonic() - t0,
-        )
-        return BBPredictOutput(
-            success=False,
-            model="axon",
-            utterance=payload,
-            error=f"timeout after {timeout}s",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"timeout after {timeout}s"}
     except Exception as e:
-        logger.debug(
-            "Axon error: url=%s miner_hk=%s err_type=%s err='%s'",
-            url,
-            (miner_hotkey[:16] + "...") if miner_hotkey else "?",
-            type(e).__name__,
-            str(e)[:300],
-        )
-        return BBPredictOutput(
-            success=False,
-            model="axon",
-            utterance=payload,
-            error=f"{type(e).__name__}:{e}",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"{type(e).__name__}:{e}"}
 
 
-async def call_managed_container_endpoint(
+async def call_managed_container_audio_endpoint(
     endpoint_url: str,
-    payload: BBPredictedUtterance,
-    context_used: str,
+    payload: BBAudioMinerInitPayload | BBAudioMinerPredictPayload,
     miner_hotkey: str,
+    endpoint_id: Optional[str] = None,
+    endpoint_type: Optional[str] = None,
+    status: Optional[str] = None,
     timeout: Optional[float] = None,
-) -> BBPredictOutput:
-    """Call a subnet-owner-managed container endpoint for utterance prediction."""
-
+) -> dict[str, Any]:
     settings = get_settings()
     if timeout is None:
-        timeout = float(getattr(settings, "BB_ARENA_MINER_TIMEOUT_SEC", getattr(settings, "BB_MINER_TIMEOUT_SEC", 10)))
+        timeout = float(
+            getattr(
+                settings,
+                "BB_ARENA_MINER_TIMEOUT_SEC",
+                getattr(settings, "BB_MINER_TIMEOUT_SEC", 10),
+            )
+        )
 
     url = endpoint_url.strip()
     if not url:
-        return BBPredictOutput(
-            success=False,
-            model="managed_container",
-            utterance=payload,
-            error="empty_endpoint_url",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": "empty_endpoint_url"}
+
+    try:
+        validator_identity = _get_validator_identity()
+    except Exception as e:
+        return {"error": f"validator_identity_error:{e}"}
+
+    endpoint_type_value = str(endpoint_type or "").strip().upper()
+    pod_wake_timeout = max(timeout, _env_float("POD_WAKE_TIMEOUT_SECONDS", 90.0))
+    if endpoint_type_value == "POD":
+        runpod_api_key = str(getenv("RUNPOD_API_KEY", "") or "").strip()
+        if not runpod_api_key:
+            return {"error": "missing_runpod_api_key_for_pod_route"}
+        if not endpoint_id:
+            return {"error": "missing_endpoint_id_for_pod_route"}
+        try:
+            if not _is_active_pod_status(status):
+                await _start_runpod_pod(
+                    endpoint_id=str(endpoint_id),
+                    runpod_api_key=runpod_api_key,
+                    timeout=timeout,
+                )
+            await _wait_for_managed_pod_health(base_url=url, timeout=pod_wake_timeout)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}:{e}"}
 
     url = _normalize_managed_predict_url(
         endpoint_url=url,
         predict_endpoint=str(getattr(settings, "BB_MINER_PREDICT_ENDPOINT", "predict")),
     )
-
     session = await get_async_client()
-    t0 = monotonic()
+    parsed_endpoint = urlparse(endpoint_url if endpoint_url.startswith(("http://", "https://")) else f"http://{endpoint_url}")
+    axon_ip = parsed_endpoint.hostname or "0.0.0.0"
+    axon_port = str(parsed_endpoint.port or 0)
+    headers = _build_bt_predict_headers(
+        validator_identity=validator_identity,
+        miner_hotkey=miner_hotkey,
+        axon_ip=axon_ip,
+        axon_port=axon_port,
+        timeout=timeout,
+        payload=payload,
+    )
     try:
         async with session.post(
             url,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             json=payload.model_dump(mode="json"),
             timeout=ClientTimeout(total=timeout),
         ) as response:
             text = await response.text()
             if response.status != 200:
                 logger.debug(
-                    "Managed container non-200: status=%s body='%s' url=%s miner_hk=%s",
+                    "Managed audio non-200: status=%s body='%s' url=%s miner_hk=%s",
                     response.status,
                     text[:200],
                     url,
                     (miner_hotkey[:16] + "...") if miner_hotkey else "?",
                 )
-                return BBPredictOutput(
-                    success=False,
-                    model="managed_container",
-                    utterance=payload,
-                    error=f"{response.status}:{text[:300]}",
-                    context_used=context_used,
-                    complete=False,
-                )
-
+                return {"error": f"{response.status}:{text[:300]}"}
             try:
                 data = loads(text)
             except Exception as e:
-                return BBPredictOutput(
-                    success=False,
-                    model="managed_container",
-                    utterance=payload,
-                    error=f"parse:{e}",
-                    context_used=context_used,
-                    complete=False,
-                )
-
-            prediction = data.get("prediction", "") if isinstance(data, dict) else ""
-            return BBPredictOutput(
-                success=True,
-                model="managed_container",
-                utterance=BBPredictedUtterance(
-                    index=payload.index,
-                    step=payload.step,
-                    prefix=payload.prefix,
-                    prediction=prediction,
-                    context=context_used,
-                ),
-                error=None,
-                context_used=context_used,
-                complete=True,
-            )
+                return {"error": f"parse:{e}"}
+            if isinstance(data, dict):
+                return data
+            return {"error": "invalid_payload_type"}
     except TimeoutError:
-        logger.debug(
-            "Managed container timeout: url=%s miner_hk=%s timeout=%.2fs elapsed=%.2fs",
-            url,
-            (miner_hotkey[:16] + "...") if miner_hotkey else "?",
-            timeout,
-            monotonic() - t0,
-        )
-        return BBPredictOutput(
-            success=False,
-            model="managed_container",
-            utterance=payload,
-            error=f"timeout after {timeout}s",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"timeout after {timeout}s"}
     except Exception as e:
-        logger.debug(
-            "Managed container error: url=%s miner_hk=%s err_type=%s err='%s'",
-            url,
-            (miner_hotkey[:16] + "...") if miner_hotkey else "?",
-            type(e).__name__,
-            str(e)[:300],
-        )
-        return BBPredictOutput(
-            success=False,
-            model="managed_container",
-            utterance=payload,
-            error=f"{type(e).__name__}:{e}",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"{type(e).__name__}:{e}"}
 
 
-async def call_gateway_runsync_endpoint(
+async def call_gateway_runsync_audio_endpoint(
     gateway_url: str,
-    payload: BBPredictedUtterance,
-    context_used: str,
+    payload: BBAudioMinerInitPayload | BBAudioMinerPredictPayload,
     miner_hotkey: str,
     miner_uid: Optional[int] = None,
     timeout: Optional[float] = None,
-) -> BBPredictOutput:
-    """Call gateway /runsync endpoint for arena predictions."""
-
+) -> dict[str, Any]:
     settings = get_settings()
     if timeout is None:
-        timeout = float(getattr(settings, "BB_ARENA_MINER_TIMEOUT_SEC", getattr(settings, "BB_MINER_TIMEOUT_SEC", 10)))
+        timeout = float(
+            getattr(
+                settings,
+                "BB_ARENA_MINER_TIMEOUT_SEC",
+                getattr(settings, "BB_MINER_TIMEOUT_SEC", 10),
+            )
+        )
 
     url = _normalize_gateway_runsync_url(gateway_url)
     if not url:
-        return BBPredictOutput(
-            success=False,
-            model="gateway",
-            utterance=payload,
-            error="empty_gateway_url",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": "empty_gateway_url"}
 
     try:
         validator_identity = _get_validator_identity()
     except Exception as e:
-        return BBPredictOutput(
-            success=False,
-            model="gateway",
-            utterance=payload,
-            error=f"validator_identity_error:{e}",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"validator_identity_error:{e}"}
+
     if not isinstance(miner_uid, int) or miner_uid < 0:
-        return BBPredictOutput(
-            success=False,
-            model="gateway",
-            utterance=payload,
-            error="missing_miner_uid_for_gateway",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": "missing_miner_uid_for_gateway"}
 
     predict_payload = payload.model_dump(mode="json")
-
+    body_hash = hashlib.sha256(
+        dumps(predict_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
     dendrite_nonce = time.time_ns()
-    body_hash = ""
     dendrite_message = (
         f"{dendrite_nonce}.{validator_identity['hotkey']}."
         f"{miner_hotkey}.{validator_identity['uuid']}.{body_hash}"
@@ -650,7 +591,7 @@ async def call_gateway_runsync_endpoint(
         "bt_header_axon_ip": "0.0.0.0",
         "bt_header_axon_port": "0",
         "timeout": str(timeout),
-        "name": "BBPredictedUtterance",
+        "name": type(payload).__name__,
         "computed_body_hash": body_hash,
     }
     gateway_input_payload: dict[str, Any] = {
@@ -664,28 +605,25 @@ async def call_gateway_runsync_endpoint(
         runsync_path=getattr(settings, "BB_ARENA_RUNSYNC_API_PATH", "/runsync"),
     )
     if not gateway_auth_url:
-        return BBPredictOutput(
-            success=False,
-            model="gateway",
-            utterance=payload,
-            error="empty_gateway_auth_url",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": "empty_gateway_auth_url"}
 
     auth_cache_key = _gateway_auth_cache_key(
         auth_url=gateway_auth_url,
         validator_hotkey=str(validator_identity["hotkey"]),
+        miner_hotkey=str(miner_hotkey),
+        miner_uid=int(miner_uid),
     )
 
     session = await get_async_client()
-    t0 = monotonic()
     try:
-        for attempt in range(2):
-            auth_token = _get_cached_gateway_auth_token(auth_cache_key)
+        auth_token = _get_cached_gateway_auth_token(auth_cache_key)
+
+        deadline = monotonic() + max(1.0, float(timeout))
+        request_attempt = 0
+        auth_attempt = 0
+        while True:
             if not auth_token:
-                token, expires_in, auth_error = await _get_or_request_gateway_auth_token(
-                    cache_key=auth_cache_key,
+                token, expires_in, auth_error = await _request_gateway_auth_token(
                     auth_url=gateway_auth_url,
                     validator_identity=validator_identity,
                     miner_hotkey=str(miner_hotkey),
@@ -693,160 +631,82 @@ async def call_gateway_runsync_endpoint(
                     timeout=float(timeout),
                 )
                 if not token:
-                    return BBPredictOutput(
-                        success=False,
-                        model="gateway",
-                        utterance=payload,
-                        error=f"gateway_auth_failed:{auth_error}",
-                        context_used=context_used,
-                        complete=False,
-                    )
+                    return {"error": f"gateway_auth_failed:{auth_error}"}
                 auth_token = token
+                _store_gateway_auth_token(auth_cache_key, auth_token, expires_in)
 
+            request_attempt += 1
             request_body: dict[str, Any] = {
                 "input": gateway_input_payload,
                 "auth_token": auth_token,
                 "uid": miner_uid,
                 "miner_hotkey": miner_hotkey,
+                "request_id": (
+                    f"gw-audio:{type(payload).__name__}:{miner_uid}:"
+                    f"{request_attempt}:{uuid.uuid4().hex}"
+                ),
             }
-
             async with session.post(
                 url,
                 headers={"Content-Type": "application/json"},
                 json=request_body,
-                timeout=ClientTimeout(total=timeout),
+                timeout=ClientTimeout(total=max(1.0, min(float(timeout), deadline - monotonic()))),
             ) as response:
                 text = await response.text()
-                if response.status == 401 and attempt == 0:
+                if response.status == 401 and auth_attempt == 0:
                     _clear_gateway_auth_token(auth_cache_key)
                     auth_token = ""
+                    auth_attempt += 1
                     continue
                 if response.status != 200:
+                    remaining = deadline - monotonic()
+                    if _is_retryable_gateway_error(response.status, text) and remaining > 1.0:
+                        delay = min(_gateway_retry_delay_seconds(request_attempt - 1), max(0.1, remaining - 0.5))
+                        logger.info(
+                            "Gateway audio retryable response: status=%s delay=%.2fs remaining=%.2fs body='%s' url=%s miner_hk=%s",
+                            response.status,
+                            delay,
+                            remaining,
+                            text[:200],
+                            url,
+                            (miner_hotkey[:16] + "...") if miner_hotkey else "?",
+                        )
+                        await asyncio.sleep(delay)
+                        continue
                     logger.debug(
-                        "Gateway non-200: status=%s body='%s' url=%s miner_hk=%s",
+                        "Gateway audio non-200: status=%s body='%s' url=%s miner_hk=%s",
                         response.status,
                         text[:200],
                         url,
                         (miner_hotkey[:16] + "...") if miner_hotkey else "?",
                     )
-                    return BBPredictOutput(
-                        success=False,
-                        model="gateway",
-                        utterance=payload,
-                        error=f"{response.status}:{text[:300]}",
-                        context_used=context_used,
-                        complete=False,
-                    )
-
+                    return {"error": f"{response.status}:{text[:300]}"}
                 try:
                     data = loads(text)
                 except Exception as e:
-                    return BBPredictOutput(
-                        success=False,
-                        model="gateway",
-                        utterance=payload,
-                        error=f"parse:{e}",
-                        context_used=context_used,
-                        complete=False,
-                    )
-
-                prediction = _extract_prediction_from_provider_payload(data)
-                status = str(data.get("status", "")).upper() if isinstance(data, dict) else ""
-                if not prediction:
-                    detail = ""
-                    if isinstance(data, dict):
-                        error_field = data.get("error")
-                        detail = f":{error_field}" if error_field is not None else ""
-                    if status and status in {"COMPLETED", "SUCCEEDED"}:
-                        return BBPredictOutput(
-                            success=False,
-                            model="gateway",
-                            utterance=payload,
-                            error=f"empty_prediction_from_gateway{detail}",
-                            context_used=context_used,
-                            complete=False,
-                        )
-                if not prediction and status and status not in {"COMPLETED", "SUCCEEDED"}:
-                    detail = ""
-                    if isinstance(data, dict):
-                        error_field = data.get("error")
-                        detail = f":{error_field}" if error_field is not None else ""
-                    return BBPredictOutput(
-                        success=False,
-                        model="gateway",
-                        utterance=payload,
-                        error=f"gateway_status={status}{detail}",
-                        context_used=context_used,
-                        complete=False,
-                    )
-
-                return BBPredictOutput(
-                    success=True,
-                    model="gateway",
-                    utterance=BBPredictedUtterance(
-                        index=payload.index,
-                        step=payload.step,
-                        prefix=payload.prefix,
-                        prediction=prediction,
-                        context=context_used,
-                    ),
-                    error=None,
-                    context_used=context_used,
-                    complete=True,
-                )
-
-        return BBPredictOutput(
-            success=False,
-            model="gateway",
-            utterance=payload,
-            error="gateway_auth_failed:unauthorized_after_refresh",
-            context_used=context_used,
-            complete=False,
-        )
+                    return {"error": f"parse:{e}"}
+                if isinstance(data, dict):
+                    output = data.get("output")
+                    if isinstance(output, dict):
+                        return output
+                    return data
+                return {"error": "invalid_payload_type"}
+            if monotonic() >= deadline:
+                break
+        return {"error": f"gateway_retry_timeout after {timeout}s"}
     except TimeoutError:
-        logger.debug(
-            "Gateway timeout: url=%s miner_hk=%s timeout=%.2fs elapsed=%.2fs",
-            url,
-            (miner_hotkey[:16] + "...") if miner_hotkey else "?",
-            timeout,
-            monotonic() - t0,
-        )
-        return BBPredictOutput(
-            success=False,
-            model="gateway",
-            utterance=payload,
-            error=f"timeout after {timeout}s",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"timeout after {timeout}s"}
     except Exception as e:
-        logger.debug(
-            "Gateway error: url=%s miner_hk=%s err_type=%s err='%s'",
-            url,
-            (miner_hotkey[:16] + "...") if miner_hotkey else "?",
-            type(e).__name__,
-            str(e)[:300],
-        )
-        return BBPredictOutput(
-            success=False,
-            model="gateway",
-            utterance=payload,
-            error=f"{type(e).__name__}:{e}",
-            context_used=context_used,
-            complete=False,
-        )
+        return {"error": f"{type(e).__name__}:{e}"}
 
 
-async def call_managed_route_endpoint(
+async def call_managed_route_audio_endpoint(
     *,
     route: Any,
-    payload: BBPredictedUtterance,
-    context_used: str,
+    payload: BBAudioMinerInitPayload | BBAudioMinerPredictPayload,
     miner_hotkey: str,
     timeout: Optional[float] = None,
-) -> BBPredictOutput:
-    """Dispatch arena route invocation based on provider metadata."""
-
+) -> dict[str, Any]:
     endpoint_url = str(getattr(route, "endpoint_url", "") or "").strip()
     provider = str(getattr(route, "provider", "") or "").strip().lower()
     miner_uid_raw = getattr(route, "miner_uid", None)
@@ -858,19 +718,20 @@ async def call_managed_route_endpoint(
             miner_uid = None
 
     if provider == "gateway":
-        return await call_gateway_runsync_endpoint(
+        return await call_gateway_runsync_audio_endpoint(
             gateway_url=endpoint_url,
             payload=payload,
-            context_used=context_used,
             miner_hotkey=miner_hotkey,
             miner_uid=miner_uid,
             timeout=timeout,
         )
 
-    return await call_managed_container_endpoint(
+    return await call_managed_container_audio_endpoint(
         endpoint_url=endpoint_url,
         payload=payload,
-        context_used=context_used,
         miner_hotkey=miner_hotkey,
+        endpoint_id=getattr(route, "endpoint_id", None),
+        endpoint_type=getattr(route, "endpoint_type", None),
+        status=getattr(route, "status", None),
         timeout=timeout,
     )

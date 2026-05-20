@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -45,10 +46,18 @@ class SubtensorGatewayClient:
     async def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         sess = await _get_session()
         async with sess.post(f"{self.base_url}{path}", json=payload) as resp:
-            body = await resp.json(content_type=None)
+            text = await resp.text()
+            try:
+                body = json.loads(text)
+            except Exception:
+                body = None
             if resp.status >= 400:
                 raise RuntimeError(
-                    f"gateway {path} failed status={resp.status} body={body}"
+                    f"gateway {path} failed status={resp.status} body={text[:300]}"
+                )
+            if not isinstance(body, dict):
+                raise RuntimeError(
+                    f"gateway {path} returned invalid json body={text[:300]}"
                 )
             return body
 

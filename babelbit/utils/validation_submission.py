@@ -1,5 +1,6 @@
 import asyncio
 import json
+import mimetypes
 import os
 import time
 from logging import getLogger
@@ -26,6 +27,7 @@ class ValidationSubmissionClient:
         settings = get_settings()
         self.base_url = (base_url or settings.BB_SUBMIT_API_URL).rstrip("/")
         self.submit_url = f"{self.base_url}/v1/submit"
+        self.submit_artifact_url = f"{self.base_url}/v1/submit-artifact"
         self.timeout = timeout if timeout is not None else int(os.getenv("BB_SUBMIT_TIMEOUT_S", "30"))
         if enabled is None:
             enabled = os.getenv("BB_ENABLE_VALIDATION_SUBMISSIONS", "1").lower() in {"1", "true", "yes"}
@@ -155,6 +157,95 @@ class ValidationSubmissionClient:
             file_path.name,
             file_type,
             self.submit_url,
+            elapsed_s,
+        )
+        return True
+
+    async def submit_validation_artifact(
+        self,
+        *,
+        file_path: Path,
+        challenge_id: str,
+        main_challenge_uid: str,
+        miner_uid: Optional[int],
+        miner_hotkey: Optional[str],
+        kind: str = "audio_bundle",
+        extra_data: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Sign artifact metadata and POST a multipart upload to the artifact API."""
+        if not self.is_ready:
+            return False
+
+        if kind != "audio_bundle":
+            logger.warning("Validation artifact submit rejected client-side due to invalid kind: %s", kind)
+            return False
+
+        if not file_path.exists():
+            logger.warning("Validation artifact submit skipped; file does not exist: %s", file_path)
+            return False
+
+        content_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        data: Dict[str, Any] = {
+            "file_type": "artifact",
+            "file_name": file_path.name,
+            "challenge_uid": challenge_id,
+            "main_challenge_uid": main_challenge_uid,
+            "miner_uid": miner_uid,
+            "miner_hotkey": miner_hotkey,
+            "file_size": file_path.stat().st_size,
+            "content_type": content_type,
+        }
+        if extra_data:
+            data.update(extra_data)
+
+        payload = self._build_signed_payload(challenge_id or "", miner_hotkey or "", miner_uid or 0, data)
+        payload["kind"] = kind
+
+        started_at = time.perf_counter()
+
+        def _post_artifact():
+            metadata = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            with file_path.open("rb") as file_handle:
+                return requests.post(
+                    self.submit_artifact_url,
+                    data={"metadata": metadata},
+                    files={"file": (file_path.name, file_handle, content_type)},
+                    timeout=self.timeout,
+                )
+
+        try:
+            response = await asyncio.to_thread(_post_artifact)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            elapsed_s = time.perf_counter() - started_at
+            logger.warning(
+                "Validation artifact submit failed for %s via %s after %.2fs (timeout=%ss): %s",
+                file_path.name,
+                self.submit_artifact_url,
+                elapsed_s,
+                self.timeout,
+                e,
+            )
+            return False
+
+        if response.status_code != 200:
+            elapsed_s = time.perf_counter() - started_at
+            logger.warning(
+                "Validation artifact submit rejected for %s via %s after %.2fs: %s %s",
+                file_path.name,
+                self.submit_artifact_url,
+                elapsed_s,
+                response.status_code,
+                response.text,
+            )
+            return False
+
+        elapsed_s = time.perf_counter() - started_at
+        logger.info(
+            "Validation artifact submit accepted for %s via %s in %.2fs",
+            file_path.name,
+            self.submit_artifact_url,
             elapsed_s,
         )
         return True

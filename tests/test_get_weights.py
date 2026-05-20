@@ -129,7 +129,7 @@ def test_get_arena_incentive_fraction_uses_settings_default_when_env_missing(
 
     monkeypatch.delenv("BB_ARENA_INCENTIVE_PERCENT", raising=False)
 
-    assert validate_mod._get_arena_incentive_fraction() == pytest.approx(0.8)
+    assert validate_mod._get_arena_incentive_fraction() == pytest.approx(0.9)
 
 
 def test_get_arena_incentive_fraction_uses_settings_default_for_invalid_env(
@@ -139,7 +139,7 @@ def test_get_arena_incentive_fraction_uses_settings_default_for_invalid_env(
 
     monkeypatch.setenv("BB_ARENA_INCENTIVE_PERCENT", "not-a-number")
 
-    assert validate_mod._get_arena_incentive_fraction() == pytest.approx(0.8)
+    assert validate_mod._get_arena_incentive_fraction() == pytest.approx(0.9)
 
 
 @pytest.mark.asyncio

@@ -2,6 +2,10 @@
 FROM python:3.12-slim-bullseye AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+# Use CPU-only PyTorch wheels during image builds; the default PyPI torch
+# resolution pulls large CUDA dependencies that exhaust Docker disk space.
+ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
@@ -26,7 +30,9 @@ FROM base AS prod-dependencies
 COPY pyproject.toml README.md ./
 
 # Install production dependencies
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir . \
+    && pip uninstall -y cyscale || true \
+    && pip install --no-cache-dir --force-reinstall scalecodec==1.2.12 async-substrate-interface==1.5.12
 
 
 # Stage 3: Test dependencies - extends production dependencies
@@ -48,7 +54,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . /app
 
 # Install package in editable mode (dependencies already installed)
-RUN pip install --no-cache-dir --no-deps -e .
+RUN pip install --no-cache-dir --no-deps -e . \
+    && pip uninstall -y cyscale || true \
+    && pip install --no-cache-dir --force-reinstall scalecodec==1.2.12 async-substrate-interface==1.5.12
 
 # Run tests and write a success marker if they pass
 RUN python -m pytest tests/ -v --tb=short && touch /tests-passed
@@ -65,7 +73,9 @@ COPY --from=prod-dependencies /usr/local/bin /usr/local/bin
 COPY . /app
 
 # Install package (non-editable, dependencies already present)
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps . \
+    && pip uninstall -y cyscale || true \
+    && pip install --no-cache-dir --force-reinstall scalecodec==1.2.12 async-substrate-interface==1.5.12
 
 ENV PATH="/root/.local/bin:$PATH"
 

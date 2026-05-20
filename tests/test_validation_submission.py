@@ -116,3 +116,74 @@ async def test_disabled_client_skips_submission(monkeypatch):
 
         assert ok is False
         post_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_submit_validation_artifact_success(tmp_path, monkeypatch):
+    test_file = tmp_path / "audio.tar"
+    test_file.write_bytes(b"tar-bytes")
+
+    with patch("babelbit.utils.validation_submission.get_settings") as mock_settings, \
+         patch("babelbit.utils.validation_submission.load_hotkey_keypair", return_value=_make_hotkey()):
+        mock_settings.return_value = SimpleNamespace(
+            BITTENSOR_WALLET_COLD="cold",
+            BITTENSOR_WALLET_HOT="hot",
+            BB_SUBMIT_API_URL="http://submit.test",
+        )
+
+        post_mock = Mock(return_value=SimpleNamespace(status_code=200, text="ok"))
+        monkeypatch.setattr("babelbit.utils.validation_submission.requests.post", post_mock)
+
+        client = ValidationSubmissionClient()
+        assert client.is_ready
+
+        ok = await client.submit_validation_artifact(
+            file_path=test_file,
+            challenge_id="ch-123",
+            main_challenge_uid="ch-123",
+            miner_uid=1,
+            miner_hotkey="hk",
+            extra_data={"challenge_type": "main", "protocol": "s2s_audio_v1"},
+        )
+
+        assert ok is True
+        post_mock.assert_called_once()
+        called_kwargs = post_mock.call_args.kwargs
+        metadata = called_kwargs["data"]["metadata"]
+        uploaded_file = called_kwargs["files"]["file"]
+        filename, _file_obj, content_type = uploaded_file
+
+        assert called_kwargs["timeout"] == client.timeout
+        assert filename == "audio.tar"
+        assert content_type == "application/x-tar"
+        assert '"kind":"audio_bundle"' in metadata
+        assert '"challenge_id":"ch-123"' in metadata
+        assert '"protocol":"s2s_audio_v1"' in metadata
+        assert '"file_size":9' in metadata
+
+
+@pytest.mark.asyncio
+async def test_submit_validation_artifact_rejects_invalid_kind(monkeypatch):
+    with patch("babelbit.utils.validation_submission.get_settings") as mock_settings, \
+         patch("babelbit.utils.validation_submission.load_hotkey_keypair", return_value=_make_hotkey()):
+        mock_settings.return_value = SimpleNamespace(
+            BITTENSOR_WALLET_COLD="cold",
+            BITTENSOR_WALLET_HOT="hot",
+            BB_SUBMIT_API_URL="http://submit.test",
+        )
+
+        post_spy = Mock()
+        monkeypatch.setattr("babelbit.utils.validation_submission.requests.post", post_spy)
+
+        client = ValidationSubmissionClient()
+        ok = await client.submit_validation_artifact(
+            file_path=Path("missing.tar"),
+            challenge_id="ch-123",
+            main_challenge_uid="ch-123",
+            miner_uid=1,
+            miner_hotkey="hk",
+            kind="not_allowed",
+        )
+
+        assert ok is False
+        post_spy.assert_not_called()

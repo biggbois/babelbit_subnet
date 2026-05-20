@@ -14,6 +14,8 @@ from babelbit.utils.settings import get_settings
 
 logger = logging.getLogger("sv-subtensor-gateway")
 
+_BLOCK_WAIT_POLL_INTERVAL_S = 0.5
+
 
 class _GatewayState:
     def __init__(self):
@@ -76,6 +78,45 @@ class _GatewayState:
 
 
 STATE = _GatewayState()
+
+
+async def _get_current_block_resilient(*, retries: int = 2) -> int:
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        try:
+            st = await STATE.get_subtensor()
+            block = await st.get_current_block()
+            return int(block)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            logger.warning(
+                "[gateway] current block failed attempt %d/%d: %s: %s",
+                attempt + 1,
+                retries,
+                type(exc).__name__,
+                exc,
+            )
+            await STATE.reset_subtensor()
+    assert last_error is not None
+    raise last_error
+
+
+async def _wait_for_next_block_polling(timeout_s: float | None) -> int:
+    start_block = await _get_current_block_resilient()
+    deadline = None if timeout_s is None else time.monotonic() + float(timeout_s)
+
+    while True:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise asyncio.TimeoutError("timed out waiting for next block")
+            await asyncio.sleep(min(_BLOCK_WAIT_POLL_INTERVAL_S, remaining))
+        else:
+            await asyncio.sleep(_BLOCK_WAIT_POLL_INTERVAL_S)
+
+        block = await _get_current_block_resilient()
+        if block > start_block:
+            return block
 
 
 def _to_int_list(values: Any) -> list[int]:
@@ -154,20 +195,40 @@ async def run_subtensor_gateway() -> None:
         return web.json_response({"ok": True})
 
     async def block_current_handler(_req: web.Request):
-        st = await STATE.get_subtensor()
-        block = await st.get_current_block()
-        return web.json_response({"block": int(block)})
+        try:
+            block = await _get_current_block_resilient()
+            return web.json_response({"block": int(block)})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[gateway] block/current failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return web.json_response(
+                {"error": f"{type(exc).__name__}: {exc}"}, status=503
+            )
 
     async def block_wait_handler(req: web.Request):
         payload = await req.json()
         timeout_s = payload.get("timeout_s")
-        st = await STATE.get_subtensor()
-        if timeout_s is None:
-            await st.wait_for_block()
-        else:
-            await asyncio.wait_for(st.wait_for_block(), timeout=float(timeout_s))
-        block = await st.get_current_block()
-        return web.json_response({"block": int(block)})
+        try:
+            block = await _wait_for_next_block_polling(
+                None if timeout_s is None else float(timeout_s)
+            )
+            return web.json_response({"block": int(block)})
+        except asyncio.TimeoutError as exc:
+            return web.json_response(
+                {"error": f"{type(exc).__name__}: {exc}"}, status=504
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[gateway] block/wait failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return web.json_response(
+                {"error": f"{type(exc).__name__}: {exc}"}, status=503
+            )
 
     async def metagraph_snapshot_handler(req: web.Request):
         payload = await req.json()
@@ -202,7 +263,8 @@ async def run_subtensor_gateway() -> None:
 
         if not uids or len(uids) != len(weights):
             return web.json_response(
-                {"success": False, "error": "uids/weights mismatch or empty"}, status=400
+                {"success": False, "error": "uids/weights mismatch or empty"},
+                status=400,
             )
 
         for attempt in range(retries):

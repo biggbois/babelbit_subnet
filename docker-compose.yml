@@ -39,13 +39,13 @@ services:
         SENTENCE_TRANSFORMERS_HOME: /opt/hf/sentence_transformers
         # Disable hf_transfer fast-download unless the package is installed in the image
         HF_HUB_ENABLE_HF_TRANSFER: 0
-        EMBEDDER_NAME: ${EMBEDDER_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+        BB_AUDIO_SCORING_EMBEDDER: ${BB_AUDIO_SCORING_EMBEDDER:-sentence-transformers/all-MiniLM-L6-v2}
       volumes:
         - hf-cache:/opt/hf
       command: [
         "python",
         "-c",
-        "import os, importlib.util; os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER','0'); os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1' if importlib.util.find_spec('hf_transfer') else '0'; from sentence_transformers import SentenceTransformer; m=os.getenv('EMBEDDER_NAME','mixedbread-ai/mxbai-embed-large-v1'); print('[PREWARM] caching', m, 'with hf_transfer=', os.environ['HF_HUB_ENABLE_HF_TRANSFER']); SentenceTransformer(m); print('[PREWARM] done')"
+        "import os, importlib.util; os.environ.setdefault('HF_HUB_ENABLE_HF_TRANSFER','0'); os.environ['HF_HUB_ENABLE_HF_TRANSFER'] = '1' if importlib.util.find_spec('hf_transfer') else '0'; from sentence_transformers import SentenceTransformer; m=os.getenv('BB_AUDIO_SCORING_EMBEDDER','sentence-transformers/all-MiniLM-L6-v2'); print('[PREWARM] caching', m, 'with hf_transfer=', os.environ['HF_HUB_ENABLE_HF_TRANSFER']); SentenceTransformer(m); print('[PREWARM] done')"
       ]
   validator:
     <<: *common
@@ -53,7 +53,7 @@ services:
     mem_limit: "1g"
     container_name: babelbit-validator
     environment:
-      - BABELBIT_CACHE_DIR=/app/data/blocks
+      - BABELBIT_CACHE_DIR=/app/data/blocks 
       - SIGNER_URL=http://signer:8080
       - SUBTENSOR_GATEWAY_URL=http://subtensor-gateway:8090
       - BB_CHALLENGE_STATUS_DIR=/app/data/challenge_status
@@ -102,8 +102,8 @@ services:
       HF_HOME: /opt/hf
       TRANSFORMERS_CACHE: /opt/hf/transformers
       SENTENCE_TRANSFORMERS_HOME: /opt/hf/sentence_transformers
-      HF_HUB_ENABLE_HF_TRANSFER: 1
-      EMBEDDER_NAME: ${EMBEDDER_NAME:-mixedbread-ai/mxbai-embed-large-v1}
+      HF_HUB_ENABLE_HF_TRANSFER: 0
+      BB_AUDIO_SCORING_EMBEDDER: ${BB_AUDIO_SCORING_EMBEDDER:-sentence-transformers/all-MiniLM-L6-v2}
     command: ["bb", "-v", "runner"]
 
   signer:

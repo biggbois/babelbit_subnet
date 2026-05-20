@@ -1,13 +1,8 @@
-import os
 import json
-import random
-import asyncio
+import os
 from datetime import datetime
-import time
 from logging import getLogger
-from typing import List, Optional, Set, Tuple
-from babelbit.utils.miner_registry import get_miners_from_registry, Miner
-from babelbit.schemas.prediction import BBPredictedUtterance
+from typing import Optional, Set, Tuple
 
 logger = getLogger(__name__)
 
@@ -18,8 +13,15 @@ _CHALLENGE_TYPE_ALIASES = {
 }
 
 
-def normalize_challenge_type(challenge_type: object, default: Optional[str] = None) -> Optional[str]:
-    """Normalize challenge type values while preserving backward compatibility."""
+def _resolve_timestamp(timestamp: Optional[str] = None) -> str:
+    if isinstance(timestamp, str) and timestamp.strip():
+        return timestamp.strip()
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def normalize_challenge_type(
+    challenge_type: object, default: Optional[str] = None
+) -> Optional[str]:
     if isinstance(challenge_type, str):
         normalized = challenge_type.strip().lower()
         if normalized:
@@ -27,162 +29,69 @@ def normalize_challenge_type(challenge_type: object, default: Optional[str] = No
     return default
 
 
-def create_dialogue_score_file_data(
-    miner: Miner,
-    challenge_uid: Optional[str],
-    dialogue_uid: str,
-    evaluated_utterances: List[BBPredictedUtterance],
-    dialogue_score: float,
-    log_file_path: Optional[str] = None,
-    challenge_type: str = "main",
+def save_challenge_run_file(
+    run_data: dict, output_dir: str = "scores", timestamp: Optional[str] = None
 ):
-    """
-    Create score file data structure matching the expected JSON format.
-    """
-    # Group utterances by utterance number for the output format
-    utterances_by_number = {}
-    for utterance in evaluated_utterances:
-        utterance_num = getattr(utterance, "utterance_number", 1)  # Default to 1 if not set
-        if utterance_num not in utterances_by_number:
-            utterances_by_number[utterance_num] = {
-                "utterance_number": utterance_num,
-                "ground_truth": utterance.ground_truth or "",
-                "steps": [],
-                "best_step": 0,
-                "U_best": -1.0,
-                "total_steps": 0,
-            }
-
-        # Add this step to the utterance
-        if utterance.evaluation:
-            step_data = {
-                "step": len(utterances_by_number[utterance_num]["steps"]),
-                "lexical_similarity": getattr(utterance.evaluation, "lexical_similarity", 0.0),
-                "semantic_similarity": getattr(utterance.evaluation, "semantic_similarity", 0.0),
-                "earliness": getattr(utterance.evaluation, "earliness", 0.0),
-                "U_step": getattr(utterance.evaluation, "u_step", 0.0),
-                "prefix": utterance.prediction or "",
-            }
-            utterances_by_number[utterance_num]["steps"].append(step_data)
-
-            # Update best step if this one is better
-            if step_data["U_step"] > utterances_by_number[utterance_num]["U_best"]:
-                utterances_by_number[utterance_num]["U_best"] = step_data["U_step"]
-                utterances_by_number[utterance_num]["best_step"] = step_data["step"]
-
-    # Update total steps count
-    for utterance_data in utterances_by_number.values():
-        utterance_data["total_steps"] = len(utterance_data["steps"])
-
-    return {
-        "log_file": log_file_path,
-        "challenge_uid": challenge_uid,
-        "challenge_type": normalize_challenge_type(challenge_type, default="main"),
-        "dialogue_uid": dialogue_uid,
-        "miner_uid": miner.uid,
-        "miner_hotkey": miner.hotkey,
-        "utterances": list(utterances_by_number.values()),
-        "dialogue_summary": {
-            "average_U_best_early": dialogue_score,
-        },
-    }
-
-
-def save_dialogue_score_file(score_data: dict, output_dir: str = "scores"):
-    """
-    Save score data to JSON file with timestamp.
-    """
-
     os.makedirs(output_dir, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    miner_uid = score_data.get("miner_uid", "unknown")
-    dialogue_uid = score_data.get("dialogue_uid", "unknown")
-    challenge_uid = score_data.get("challenge_uid", "unknown")
-    challenge_type = normalize_challenge_type(score_data.get("challenge_type"), default="main")
-    score_data["challenge_type"] = challenge_type
+    timestamp_value = _resolve_timestamp(timestamp)
+    miner_uid = run_data.get("miner_uid", "unknown")
+    challenge_uid = run_data.get("challenge_uid", "unknown")
+    challenge_type = normalize_challenge_type(
+        run_data.get("challenge_type"), default="main"
+    )
+    run_data["challenge_type"] = challenge_type
 
     filename = (
-        f"dialogue_run_{challenge_uid}_type_{challenge_type}"
-        f"_miner_{miner_uid}_dlg_{dialogue_uid}_run_{timestamp}-score.json"
+        f"challenge_run_{challenge_uid}_type_{challenge_type}"
+        f"_miner_{miner_uid}_run_{timestamp_value}.json"
     )
     filepath = os.path.join(output_dir, filename)
 
-    with open(filepath, "w") as f:
-        json.dump(score_data, f, indent=2)
+    with open(filepath, "w") as file_handle:
+        json.dump(run_data, file_handle, indent=2)
 
-    logger.info(f"Saved score file: {filepath}")
+    logger.info("Saved challenge run file: %s", filepath)
     return filepath
 
 
-def aggregate_utterance_scores_to_dialogue(utterance_scores: List[float]) -> float:
-    """
-    Aggregate utterance scores into a single dialogue score.
-    Dialogue score is just the average of the utterance scores.
-    """
-    if not utterance_scores:
-        return 0.0
-
-    return sum(utterance_scores) / len(utterance_scores)
-
-
-def create_challenge_summary_data(
-    challenge_uid: str,
-    miner: Miner,
-    dialogue_scores: List[float],
-    dialogue_uids: List[str],
-    run_file_path: Optional[str] = None,
-    challenge_file_path: Optional[str] = None,
-    challenge_type: str = "main",
-) -> dict:
-    """
-    Create challenge summary data structure for the overall challenge results.
-    """
-    dialogues = []
-    for i, (dialogue_uid, score) in enumerate(zip(dialogue_uids, dialogue_scores)):
-        dialogues.append(
-            {
-                "dialogue_average_u_best_early": score,
-                "dialogue_uid": dialogue_uid,
-                "dialogue_index": i,
-            }
-        )
-
-    # Calculate challenge mean score
-    challenge_mean_u = sum(dialogue_scores) / len(dialogue_scores) if dialogue_scores else 0.0
-
-    return {
-        "run_file": run_file_path,
-        "challenge_file": challenge_file_path,
-        "challenge_uid": challenge_uid,
-        "challenge_type": normalize_challenge_type(challenge_type, default="main"),
-        "miner_uid": miner.uid,
-        "miner_hotkey": miner.hotkey,
-        "dialogues": dialogues,
-        "challenge_mean_U": challenge_mean_u,
-    }
-
-
-def save_challenge_summary_file(summary_data: dict, output_dir: str = "scores"):
-    """
-    Save challenge summary data to JSON file with timestamp.
-    """
+def save_challenge_score_file(
+    summary_data: dict, output_dir: str = "scores", timestamp: Optional[str] = None
+):
     os.makedirs(output_dir, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp_value = _resolve_timestamp(timestamp)
     challenge_uid = summary_data.get("challenge_uid", "unknown")
     miner_uid = summary_data.get("miner_uid", "unknown")
-    challenge_type = normalize_challenge_type(summary_data.get("challenge_type"), default="main")
+    challenge_type = normalize_challenge_type(
+        summary_data.get("challenge_type"), default="main"
+    )
     summary_data["challenge_type"] = challenge_type
 
-    filename = f"challenge_run_{challenge_uid}_type_{challenge_type}_miner_{miner_uid}_run_{timestamp}.json"
+    filename = f"challenge_score_{challenge_uid}_type_{challenge_type}_miner_{miner_uid}_score_{timestamp_value}.json"
     filepath = os.path.join(output_dir, filename)
 
-    with open(filepath, "w") as f:
-        json.dump(summary_data, f, indent=2)
+    with open(filepath, "w") as file_handle:
+        json.dump(summary_data, file_handle, indent=2)
 
-    logger.info(f"Saved challenge summary file: {filepath}")
+    logger.info("Saved challenge score file: %s", filepath)
     return filepath
+
+
+def save_dialogue_score_file(
+    score_data: dict, output_dir: str = "scores", timestamp: Optional[str] = None
+):
+    return save_challenge_run_file(
+        score_data, output_dir=output_dir, timestamp=timestamp
+    )
+
+
+def save_challenge_summary_file(
+    summary_data: dict, output_dir: str = "scores", timestamp: Optional[str] = None
+):
+    return save_challenge_score_file(
+        summary_data, output_dir=output_dir, timestamp=timestamp
+    )
 
 
 def get_processed_miners_for_challenge(
@@ -190,15 +99,6 @@ def get_processed_miners_for_challenge(
     challenge_uid: str,
     challenge_type: Optional[str] = None,
 ) -> Set[Tuple[int, str]]:
-    """Scan existing score files in output_dir and return set of (miner_uid, miner_hotkey)
-    that have already produced results for the given challenge_uid.
-
-    A miner is considered processed if any JSON file in the directory contains matching
-    challenge_uid, miner_uid and miner_hotkey fields. When challenge_type is provided,
-    only files with matching challenge_type are considered. Legacy files without a
-    challenge_type are treated as "main", and legacy stage aliases are normalized
-    to "main"/"arena".
-    """
     processed: Set[Tuple[int, str]] = set()
     if not os.path.isdir(output_dir):
         return processed
@@ -210,8 +110,8 @@ def get_processed_miners_for_challenge(
             continue
         fpath = os.path.join(output_dir, fname)
         try:
-            with open(fpath, "r") as f:
-                data = json.load(f)
+            with open(fpath, "r") as file_handle:
+                data = json.load(file_handle)
             if (
                 isinstance(data, dict)
                 and data.get("challenge_uid") == challenge_uid
@@ -219,7 +119,9 @@ def get_processed_miners_for_challenge(
                 and "miner_hotkey" in data
             ):
                 if normalized_requested_type is not None:
-                    normalized_type = normalize_challenge_type(data.get("challenge_type"), default="main")
+                    normalized_type = normalize_challenge_type(
+                        data.get("challenge_type"), default="main"
+                    )
                     if normalized_type != normalized_requested_type:
                         continue
                 try:
@@ -229,11 +131,15 @@ def get_processed_miners_for_challenge(
                 except Exception:
                     continue
         except Exception:
-            # Ignore unreadable or malformed files
             continue
+
     if processed:
         if challenge_type is None:
-            logger.info(f"Detected {len(processed)} already processed miners for challenge {challenge_uid}")
+            logger.info(
+                "Detected %d already processed miners for challenge %s",
+                len(processed),
+                challenge_uid,
+            )
         else:
             logger.info(
                 "Detected %d already processed miners for challenge %s (type=%s)",

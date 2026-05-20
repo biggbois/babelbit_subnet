@@ -27,12 +27,27 @@ class Settings(BaseModel):
     BABELBIT_MAX_CONCURRENT_API_CALLS: int
     BB_MINER_PREDICT_ENDPOINT: str
     BB_MINER_TIMEOUT_SEC: int
+    BB_S2S_INIT_TIMEOUT_SEC: float
+    BB_S2S_CHUNK_TIMEOUT_SEC: float
+    BB_S2S_DRAIN_TIMEOUT_SEC: float
+    BB_S2S_DRAIN_MAX_REQUESTS: int
     BB_UTTERANCE_ENGINE_URL: str
+    BB_AUDIO_SCORING_METADATA_ROOT: Optional[Path] = None
+    BB_AUDIO_SCORING_STT_MODEL: str
+    BB_AUDIO_SCORING_STT_DEVICE: str
+    BB_AUDIO_SCORING_EMBEDDER: str
+    BB_AUDIO_SCORING_STT_CACHE_PATH: Path
+    BB_AUDIO_SCORING_ACCURACY_THRESHOLD: float
+    BB_AUDIO_SCORING_RATE_LOWER: float
+    BB_AUDIO_SCORING_RATE_UPPER: float
+    BB_AUDIO_SCORING_LATENCY_OVERSHOOT_FRACTION: float
+    BB_AUDIO_SCORING_LATENCY_MIN_OVERSHOOT_SEC: float
+    BB_AUDIO_SCORING_LATENCY_MAX_OVERSHOOT_SEC: float
+    BB_AUDIO_SCORING_LATENCY_POWER: float
     BB_RUNNER_ON_STARTUP: bool
     BB_SUBMIT_API_URL: str
     BB_ENABLE_ARENA_CHALLENGE: bool
     BB_ARENA_CADENCE_BLOCKS: int
-    BB_ARENA_INCENTIVE_PERCENT: float = 80.0
     BB_ARENA_RUN_ON_STARTUP: bool
     BB_ARENA_GATEWAY_URL: str
     BB_ARENA_CONTAINERS_API_PATH: str
@@ -42,6 +57,7 @@ class Settings(BaseModel):
     BB_ARENA_RUNSYNC_API_PATH: str
     BB_ARENA_GATEWAY_AUTH_API_PATH: str
     BB_ARENA_MINER_TIMEOUT_SEC: int
+    BB_ARENA_INCENTIVE_PERCENT: float = 90.0
 
     # HuggingFace
     HUGGINGFACE_USERNAME: str
@@ -121,10 +137,60 @@ def get_settings() -> Settings:
         BABELBIT_MAX_CONCURRENT_API_CALLS=int(
             getenv("BABELBIT_MAX_CONCURRENT_API_CALLS", "1")
         ),
-        BB_MINER_PREDICT_ENDPOINT=getenv("BB_MINER_PREDICT_ENDPOINT", "predict"),
+        BB_MINER_PREDICT_ENDPOINT=getenv("BB_MINER_PREDICT_ENDPOINT", "v1/predict"),
         BB_MINER_TIMEOUT_SEC=int(getenv("BB_MINER_TIMEOUT_SEC", "10")),
+        BB_S2S_INIT_TIMEOUT_SEC=float(getenv("BB_S2S_INIT_TIMEOUT_SEC", "60")),
+        BB_S2S_CHUNK_TIMEOUT_SEC=float(getenv("BB_S2S_CHUNK_TIMEOUT_SEC", "3")),
+        BB_S2S_DRAIN_TIMEOUT_SEC=float(getenv("BB_S2S_DRAIN_TIMEOUT_SEC", "10")),
+        BB_S2S_DRAIN_MAX_REQUESTS=int(getenv("BB_S2S_DRAIN_MAX_REQUESTS", "8")),
         BB_UTTERANCE_ENGINE_URL=getenv(
             "BB_UTTERANCE_ENGINE_URL", "https://api.babelbit.ai"
+        ),
+        BB_AUDIO_SCORING_METADATA_ROOT=Path(
+            getenv("BB_AUDIO_SCORING_METADATA_ROOT", "").strip()
+            or str(
+                Path(getenv("BABELBIT_CACHE_DIR", "~/.babelbit")).expanduser().resolve()
+                / "audio_scoring"
+                / "metadata"
+            )
+        )
+        .expanduser()
+        .resolve(),
+        BB_AUDIO_SCORING_STT_MODEL=getenv(
+            "BB_AUDIO_SCORING_STT_MODEL", "faster-whisper-small"
+        ),
+        BB_AUDIO_SCORING_STT_DEVICE=getenv("BB_AUDIO_SCORING_STT_DEVICE", "cpu"),
+        BB_AUDIO_SCORING_EMBEDDER=getenv(
+            "BB_AUDIO_SCORING_EMBEDDER", "all-MiniLM-L6-v2"
+        ),
+        BB_AUDIO_SCORING_STT_CACHE_PATH=Path(
+            getenv(
+                "BB_AUDIO_SCORING_STT_CACHE_PATH",
+                "~/.babelbit/audio_scoring/stt_cache.jsonl",
+            )
+        )
+        .expanduser()
+        .resolve(),
+        BB_AUDIO_SCORING_ACCURACY_THRESHOLD=float(
+            getenv("BB_AUDIO_SCORING_ACCURACY_THRESHOLD", "0.65")
+        ),
+        BB_AUDIO_SCORING_RATE_LOWER=float(
+            getenv("BB_AUDIO_SCORING_RATE_LOWER", "0.3")
+        ),
+        BB_AUDIO_SCORING_RATE_UPPER=float(
+            getenv("BB_AUDIO_SCORING_RATE_UPPER", "1.3")
+        ),
+        BB_AUDIO_SCORING_LATENCY_OVERSHOOT_FRACTION=float(
+            getenv("BB_AUDIO_SCORING_LATENCY_OVERSHOOT_FRACTION", "0.3")
+        ),
+        BB_AUDIO_SCORING_LATENCY_MIN_OVERSHOOT_SEC=float(
+            getenv("BB_AUDIO_SCORING_LATENCY_MIN_OVERSHOOT_SEC", "2.0")
+        ),
+        BB_AUDIO_SCORING_LATENCY_MAX_OVERSHOOT_SEC=float(
+            getenv("BB_AUDIO_SCORING_LATENCY_MAX_OVERSHOOT_SEC", "10.0")
+        ),
+        BB_AUDIO_SCORING_LATENCY_POWER=float(
+            getenv("BB_AUDIO_SCORING_LATENCY_POWER", "2.0")
         ),
         BB_RUNNER_ON_STARTUP=getenv("BB_RUNNER_ON_STARTUP", "false").strip().lower()
         in ("1", "true", "yes"),
@@ -134,7 +200,6 @@ def get_settings() -> Settings:
         .lower()
         in ("1", "true", "yes"),
         BB_ARENA_CADENCE_BLOCKS=int(getenv("BB_ARENA_CADENCE_BLOCKS", "300")),
-        BB_ARENA_INCENTIVE_PERCENT=float(getenv("BB_ARENA_INCENTIVE_PERCENT", "80")),
         BB_ARENA_RUN_ON_STARTUP=getenv("BB_ARENA_RUN_ON_STARTUP", "false")
         .strip()
         .lower()
@@ -145,7 +210,7 @@ def get_settings() -> Settings:
         ),
         BB_ARENA_CONTAINERS_STATUS=getenv("BB_ARENA_CONTAINERS_STATUS", "running"),
         BB_ARENA_CONTAINERS_WINDOW_SECONDS=int(
-            getenv("BB_ARENA_CONTAINERS_WINDOW_SECONDS", "300")
+            getenv("BB_ARENA_CONTAINERS_WINDOW_SECONDS", "86000")
         ),
         BB_ARENA_CONTAINERS_TIMEOUT_SEC=int(
             getenv("BB_ARENA_CONTAINERS_TIMEOUT_SEC", "10")
@@ -155,6 +220,7 @@ def get_settings() -> Settings:
             "BB_ARENA_GATEWAY_AUTH_API_PATH", "/auth/token"
         ),
         BB_ARENA_MINER_TIMEOUT_SEC=int(getenv("BB_ARENA_MINER_TIMEOUT_SEC", "10")),
+        BB_ARENA_INCENTIVE_PERCENT=float(getenv("BB_ARENA_INCENTIVE_PERCENT", "90")),
         # Development / local testing flags
         BB_DEV_MODE=getenv("BB_DEV_MODE", "0").lower() in ("1", "true", "yes"),
         BB_LOCAL_MINER_IP=getenv("BB_LOCAL_MINER_IP", ""),
@@ -193,7 +259,7 @@ def get_settings() -> Settings:
         # Miner configuration
         MINER_MODEL_ID=getenv("MINER_MODEL_ID", "babelbit-ai/base-miner"),
         MINER_MODEL_REVISION=getenv("MINER_MODEL_REVISION"),
-        MINER_AXON_PORT=int(getenv("MINER_AXON_PORT", "8091")),
+        MINER_AXON_PORT=int(getenv("MINER_AXON_PORT", "8092")),
         MINER_DEVICE=getenv("MINER_DEVICE", "cpu"),
         MINER_LOAD_IN_8BIT=getenv("MINER_LOAD_IN_8BIT", "0").lower()
         in {"1", "true", "yes"},
