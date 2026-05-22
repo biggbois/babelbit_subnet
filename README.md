@@ -80,8 +80,7 @@ As well as the a prebuilt miner we are giving you access to a bunch of our R&D.
 4. You could build your own from scratch
 
 Links:
-XXXXXXXXXXX
-XXXXXXXXXXX
+https://github.com/babelbit/babelbit_miner/tree/main/sample_code
 
 **Whichever way you do it, if you can improve the performance of our product, you will be handsomely rewarded**
 
