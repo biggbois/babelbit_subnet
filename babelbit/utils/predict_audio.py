@@ -232,6 +232,16 @@ async def start_source_audio_session(utterance_engine_url: str) -> Dict[str, Any
     )
 
 
+async def start_solo_audio_session(utterance_engine_url: str) -> Dict[str, Any]:
+    session = await get_async_client()
+    return await _call_engine_json(
+        session,
+        "GET",
+        f"{utterance_engine_url}/solo/start",
+        error_label="start solo-audio session",
+    )
+
+
 async def next_source_audio_utterance(
     utterance_engine_url: str, session_id: str
 ) -> Dict[str, Any]:
@@ -242,6 +252,19 @@ async def next_source_audio_utterance(
         f"{utterance_engine_url}/source-audio/next",
         payload={"session_id": session_id},
         error_label="advance source-audio session",
+    )
+
+
+async def next_solo_audio_utterance(
+    utterance_engine_url: str, session_id: str
+) -> Dict[str, Any]:
+    session = await get_async_client()
+    return await _call_engine_json(
+        session,
+        "POST",
+        f"{utterance_engine_url}/solo/next",
+        payload={"session_id": session_id},
+        error_label="advance solo-audio session",
     )
 
 
@@ -942,7 +965,12 @@ async def predict_source_audio_multi_miner(
     challenge_type: str = "main",
     profile: Optional[Dict[str, float]] = None,
 ) -> Tuple[Optional[str], Dict[str, BBAudioChallengeResult]]:
-    start_data = await start_source_audio_session(utterance_engine_url)
+    is_solo_challenge = challenge_type == "solo"
+    start_data = (
+        await start_solo_audio_session(utterance_engine_url)
+        if is_solo_challenge
+        else await start_source_audio_session(utterance_engine_url)
+    )
     current_utterance = _response_to_ue_utterance(start_data)
     challenge_uid = str(start_data.get("challenge_uid") or "") or None
     ue_utterance_payloads: List[Dict[str, Any]] = [start_data]
@@ -953,30 +981,31 @@ async def predict_source_audio_multi_miner(
 
     transcription_metadata: Optional[Dict[str, Any]] = None
     transcription_metadata_source = f"{utterance_engine_url.rstrip('/')}/transcription"
-    try:
-        transcription_payload = await fetch_transcription_ground_truth(
-            utterance_engine_url
-        )
-        payload_challenge_uid = str(transcription_payload.get("challenge_uid") or "")
-        payload_metadata = transcription_payload.get("metadata")
-        if payload_challenge_uid == challenge_uid and isinstance(
-            payload_metadata, dict
-        ):
-            transcription_metadata = payload_metadata
-        else:
-            logger.warning(
-                "Ignoring transcription ground truth for scoring: expected challenge=%s got challenge=%s metadata_type=%s",
-                challenge_uid,
-                payload_challenge_uid,
-                type(payload_metadata).__name__,
+    if not is_solo_challenge:
+        try:
+            transcription_payload = await fetch_transcription_ground_truth(
+                utterance_engine_url
             )
-    except Exception as exc:
-        logger.info(
-            "Transcription ground truth unavailable for challenge=%s; falling back to local scoring metadata: %s:%s",
-            challenge_uid,
-            type(exc).__name__,
-            exc,
-        )
+            payload_challenge_uid = str(transcription_payload.get("challenge_uid") or "")
+            payload_metadata = transcription_payload.get("metadata")
+            if payload_challenge_uid == challenge_uid and isinstance(
+                payload_metadata, dict
+            ):
+                transcription_metadata = payload_metadata
+            else:
+                logger.warning(
+                    "Ignoring transcription ground truth for scoring: expected challenge=%s got challenge=%s metadata_type=%s",
+                    challenge_uid,
+                    payload_challenge_uid,
+                    type(payload_metadata).__name__,
+                )
+        except Exception as exc:
+            logger.info(
+                "Transcription ground truth unavailable for challenge=%s; falling back to local scoring metadata: %s:%s",
+                challenge_uid,
+                type(exc).__name__,
+                exc,
+            )
 
     if transcription_metadata is None and challenge_uid is not None:
         transcription_metadata = _inline_metadata_from_ue_payloads(
@@ -1362,8 +1391,10 @@ async def predict_source_audio_multi_miner(
             break
 
         try:
-            next_data = await next_source_audio_utterance(
-                utterance_engine_url, session_id
+            next_data = (
+                await next_solo_audio_utterance(utterance_engine_url, session_id)
+                if is_solo_challenge
+                else await next_source_audio_utterance(utterance_engine_url, session_id)
             )
             ue_utterance_payloads.append(next_data)
             if (

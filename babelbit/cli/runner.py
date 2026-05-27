@@ -507,6 +507,11 @@ async def runner(
     utterance_engine_url = utterance_engine_url or os.getenv(
         "BB_UTTERANCE_ENGINE_URL", "http://localhost:8000"
     )
+    enable_solo_challenge = os.getenv("BB_ENABLE_SOLO_CHALLENGE", "1").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     startup_context = _format_runner_startup_context(
         version=getattr(settings, "BABELBIT_VERSION", None)
     )
@@ -514,6 +519,7 @@ async def runner(
         "runner entry "
         f"utterance_engine_url={utterance_engine_url} "
         f"netuid={NETUID} max_miners={MAX_MINERS} "
+        f"solo_enabled={enable_solo_challenge} "
         f"{startup_context}",
     )
     logger.info("[RunnerBoot] %s", startup_context)
@@ -767,6 +773,116 @@ async def runner(
                 f"challenge_uid={challenge_uid} miners={total_miners_processed} "
                 f"dialogues={total_dialogues_processed} error={challenge_error}",
             )
+
+        if enable_solo_challenge:
+            solo_timeout, solo_init_timeout = _resolve_s2s_audio_timeouts(
+                settings=settings,
+                challenge_type="solo",
+            )
+            solo_init_callback, solo_predict_callback = _build_axon_audio_callbacks(
+                miner_timeout=solo_timeout,
+                init_timeout=solo_init_timeout,
+            )
+            solo_profile: Dict[str, float] = {}
+            _stderr_boot(
+                "runner solo predict begin "
+                f"miners={len(miner_list)} timeout={solo_timeout:.2f} "
+                f"init_timeout={solo_init_timeout:.2f}",
+            )
+            try:
+                (
+                    solo_challenge_uid,
+                    solo_audio_results,
+                ) = await predict_source_audio_multi_miner(
+                    utterance_engine_url=utterance_engine_url,
+                    miners=miner_list,
+                    init_callback=solo_init_callback,
+                    predict_callback=solo_predict_callback,
+                    challenge_type="solo",
+                    profile=solo_profile,
+                )
+                solo_error = solo_profile.get("challenge_error")
+                solo_persistence_started_at = time.perf_counter()
+                try:
+                    (
+                        solo_total_miners,
+                        solo_total_dialogues,
+                        solo_scores,
+                    ) = await _score_audio_miners_for_challenge(
+                        challenge_uid=solo_challenge_uid,
+                        challenge_type="solo",
+                        miner_list=miner_list,
+                        miner_results=solo_audio_results or {},
+                        logs_dir=logs_dir,
+                        scores_dir=scores_dir,
+                        submission_client=submission_client,
+                        active_s3_manager=s3_manager,
+                        main_challenge_uid=challenge_uid,
+                    )
+                finally:
+                    solo_persistence_seconds = (
+                        time.perf_counter() - solo_persistence_started_at
+                    )
+
+                if solo_challenge_uid and solo_total_miners > 0 and not solo_error:
+                    solo_mean = (
+                        sum(solo_scores) / len(solo_scores) if solo_scores else None
+                    )
+                    mark_challenge_processed(
+                        challenge_uid=solo_challenge_uid,
+                        miner_count=solo_total_miners,
+                        total_dialogues=solo_total_dialogues,
+                        mean_score=solo_mean,
+                        challenge_type="solo",
+                        metadata={
+                            "scores_dir": str(scores_dir),
+                            "logs_dir": str(logs_dir),
+                            "paired_challenge_uid": challenge_uid,
+                        },
+                    )
+                    solo_mean_str = (
+                        f"{solo_mean:.4f}" if solo_mean is not None else "N/A"
+                    )
+                    logger.info(
+                        "Solo challenge %s completed: %d miners, %d dialogues, mean_score=%s",
+                        solo_challenge_uid,
+                        solo_total_miners,
+                        solo_total_dialogues,
+                        solo_mean_str,
+                    )
+                    _stderr_boot(
+                        "runner solo challenge complete "
+                        f"challenge_uid={solo_challenge_uid} miners={solo_total_miners} "
+                        f"dialogues={solo_total_dialogues} mean={solo_mean_str}",
+                    )
+                elif solo_challenge_uid and solo_total_miners > 0 and solo_error:
+                    logger.warning(
+                        "Solo challenge %s persisted partial S2S results but was not marked processed due to challenge error: %s",
+                        solo_challenge_uid,
+                        solo_error,
+                    )
+                _log_runner_profile(
+                    run_kind="solo",
+                    challenge_uid=solo_challenge_uid,
+                    miner_count=len(miner_list),
+                    miners_with_utterances=sum(
+                        1
+                        for result in (solo_audio_results or {}).values()
+                        if result.utterances
+                    ),
+                    dialogues_scored=solo_total_dialogues,
+                    miner_serving_seconds=solo_profile.get("miner_serving_seconds"),
+                    scoring_seconds=solo_profile.get("scoring_seconds"),
+                    persistence_seconds=solo_persistence_seconds,
+                )
+            except Exception as e:
+                logger.warning("[Solo Challenge] Failed to run solo challenge: %s", e)
+                _stderr_boot(f"runner solo failed: {type(e).__name__}: {e}")
+        else:
+            logger.debug(
+                "[runner] Solo challenge phase disabled via BB_ENABLE_SOLO_CHALLENGE"
+            )
+            _stderr_boot("runner solo challenge disabled")
 
     except Exception as e:
         _stderr_boot(f"runner failed: {type(e).__name__}: {e}")
