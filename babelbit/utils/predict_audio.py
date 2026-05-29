@@ -121,6 +121,7 @@ class _RawPrediction:
     frame_count_out: int
     session_id: str
     latency_ms: float
+    completion_sec: float
     error: Optional[str] = None
 
 
@@ -140,6 +141,7 @@ class _MinerUtteranceSession:
     first_output_frame: Optional[int] = None
     saw_out_eos: bool = False
     last_input_chunk_sent_at: Optional[float] = None
+    completed_frame: Optional[int] = None
 
 
 async def _await_predict_response(
@@ -568,13 +570,31 @@ def _prediction_failure(
         frame_count_out=0,
         session_id="",
         latency_ms=latency_ms,
+        completion_sec=latency_ms / 1000.0,
         error=f"{type(exc).__name__}:{exc}",
     )
+
+
+def _miner_output_frame_count(
+    output_chunks: List[bytes],
+    *,
+    frame_samples: int,
+    channels: int,
+    sample_width_bytes: int,
+) -> int:
+    if frame_samples <= 0 or channels <= 0 or sample_width_bytes <= 0:
+        return 0
+    bytes_per_frame = frame_samples * channels * sample_width_bytes
+    if bytes_per_frame <= 0:
+        return 0
+    return sum(len(chunk) for chunk in output_chunks) // bytes_per_frame
 
 
 def _prediction_success(session: _MinerUtteranceSession) -> _RawPrediction:
     if not session.saw_out_eos:
         raise AudioChallengeError("Miner never signaled out_eos=true")
+    if session.completed_frame is None:
+        raise AudioChallengeError("Miner completion frame was not recorded")
 
     predicted_pcm = _float32_pcm_to_int16_pcm(b"".join(session.output_chunks))
     predicted_wav = _pcm_to_wav_bytes(
@@ -583,14 +603,25 @@ def _prediction_success(session: _MinerUtteranceSession) -> _RawPrediction:
         channels=session.miner_audio.channels,
         sample_width_bytes=2,
     )
-    latency_ms = (perf_counter() - session.started_at) * 1000.0
+    completion_sec = (
+        float(session.completed_frame) / session.frame_rate_hz
+        if session.frame_rate_hz > 0
+        else 0.0
+    )
+    latency_ms = completion_sec * 1000.0
+    output_frame_count = _miner_output_frame_count(
+        session.output_chunks,
+        frame_samples=session.frame_samples,
+        channels=session.miner_audio.channels,
+        sample_width_bytes=session.miner_audio.sample_width_bytes,
+    )
     logger.info(
         "S2S audio miner completed: challenge=%s utterance=%s %s frames_in=%d frames_out=%d predicted_bytes=%d latency_ms=%.2f",
         session.ue_utterance.challenge_uid,
         session.ue_utterance.utterance_id,
         _miner_log_label(session.miner),
         len(session.input_frames),
-        len(session.output_chunks),
+        output_frame_count,
         len(predicted_wav),
         latency_ms,
     )
@@ -604,9 +635,10 @@ def _prediction_success(session: _MinerUtteranceSession) -> _RawPrediction:
         frame_rate_hz=session.frame_rate_hz,
         frame_samples=session.frame_samples,
         frame_count_in=len(session.input_frames),
-        frame_count_out=len(session.output_chunks),
+        frame_count_out=output_frame_count,
         session_id=session.session_id,
         latency_ms=latency_ms,
+        completion_sec=completion_sec,
     )
 
 
@@ -748,6 +780,7 @@ async def _predict_frame_for_miner(
     )
     if predict_response.out_eos:
         session.saw_out_eos = True
+        session.completed_frame = frame_index + 1
 
 
 async def _drain_miner_until_eos(
@@ -819,6 +852,7 @@ async def _drain_miner_until_eos(
         )
         if predict_response.out_eos:
             session.saw_out_eos = True
+            session.completed_frame = total_frames + drain_index + 1
             return
 
     raise AudioChallengeError(
@@ -1266,6 +1300,7 @@ async def predict_source_audio_multi_miner(
                             "first_output_frame": raw_predictions[i].first_output_frame,
                             "frame_rate_hz": raw_predictions[i].frame_rate_hz,
                             "source_duration_sec": source_duration_sec,
+                            "completion_sec": raw_predictions[i].completion_sec,
                         }
                         for i in successful_indices
                     ],
@@ -1301,12 +1336,7 @@ async def predict_source_audio_multi_miner(
                         if pred.decoded_audio.sample_rate_hz > 0
                         else 0.0
                     )
-                    effective_completion_sec = (
-                        (float(pred.first_output_frame) / float(pred.frame_rate_hz))
-                        + predicted_duration_sec
-                        if pred.frame_rate_hz > 0
-                        else predicted_duration_sec
-                    )
+                    effective_completion_sec = pred.completion_sec
                     batch_scores[idx] = {
                         "score": 0.0,
                         "accuracy": 0.0,

@@ -213,6 +213,34 @@ def _wav_duration_sec(wav_bytes: bytes) -> float:
         return float(frame_count) / float(sample_rate_hz)
 
 
+def _completion_sec_from_prediction(
+    pred: Dict[str, Any],
+    *,
+    predicted_duration_sec: float,
+) -> float:
+    """Use measured wall-clock completion when validators provide it.
+
+    Older callers only sent the first output frame and frame rate, which was an
+    audio-timeline approximation. Live S2S scoring should use the actual elapsed
+    time from miner init to out_eos so tiny canned responses cannot inherit a
+    plausible completion time from their decoded audio duration.
+    """
+    completion_sec = pred.get("completion_sec")
+    if completion_sec is not None:
+        try:
+            return max(0.0, float(completion_sec))
+        except (TypeError, ValueError):
+            pass
+
+    first_output_frame: int = int(pred.get("first_output_frame", 0) or 0)
+    frame_rate_hz: float = float(pred.get("frame_rate_hz", 0.0) or 0.0)
+    return (
+        (float(first_output_frame) / frame_rate_hz) + predicted_duration_sec
+        if frame_rate_hz > 0
+        else predicted_duration_sec
+    )
+
+
 def score_audio_utterance_bytes(
     *,
     predicted_wav_bytes: bytes,
@@ -248,10 +276,12 @@ def score_audio_utterance_bytes(
     )
 
     predicted_duration_sec = _wav_duration_sec(predicted_wav_bytes)
-    effective_completion_sec = (
-        (float(first_output_frame) / float(frame_rate_hz)) + predicted_duration_sec
-        if frame_rate_hz > 0
-        else predicted_duration_sec
+    effective_completion_sec = _completion_sec_from_prediction(
+        {
+            "first_output_frame": first_output_frame,
+            "frame_rate_hz": frame_rate_hz,
+        },
+        predicted_duration_sec=predicted_duration_sec,
     )
     wav_hash = sha256(predicted_wav_bytes).hexdigest()
     try:
@@ -390,14 +420,11 @@ def score_audio_utterance_batch(
     total_predicted_duration_sec = 0.0
     for pred in predictions:
         predicted_wav_bytes: bytes = pred["predicted_wav_bytes"]
-        first_output_frame: int = pred["first_output_frame"]
-        frame_rate_hz: float = pred["frame_rate_hz"]
         predicted_duration_sec = _wav_duration_sec(predicted_wav_bytes)
         total_predicted_duration_sec += predicted_duration_sec
-        effective_completion_sec = (
-            (float(first_output_frame) / float(frame_rate_hz)) + predicted_duration_sec
-            if frame_rate_hz > 0
-            else predicted_duration_sec
+        effective_completion_sec = _completion_sec_from_prediction(
+            pred,
+            predicted_duration_sec=predicted_duration_sec,
         )
         wav_hash = sha256(predicted_wav_bytes).hexdigest()
         stt_items.append({"wav_bytes": predicted_wav_bytes, "wav_hash": wav_hash})

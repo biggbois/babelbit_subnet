@@ -675,6 +675,110 @@ async def test_predict_source_audio_multi_miner_stops_sending_after_out_eos():
 
 
 @pytest.mark.asyncio
+async def test_predict_source_audio_multi_miner_uses_frame_time_for_completion():
+    wav_bytes = _build_test_wav(frame_count=10)
+    start_payload = {
+        "session_id": "ue-session",
+        "challenge_uid": "challenge-audio",
+        "utterance_index": 0,
+        "utterance_id": "challenge-audio:0",
+        "language": "fr",
+        "sample_rate_hz": 8,
+        "channels": 1,
+        "sample_width_bytes": 2,
+        "utterance_frames": 10,
+        "end_of_utterance": True,
+        "done": False,
+        "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
+    }
+    next_payload = {
+        "session_id": "ue-session",
+        "challenge_uid": "challenge-audio",
+        "done": True,
+        "end_of_utterance": True,
+        "audio_b64": "",
+    }
+
+    miners = [
+        Miner(uid=8, hotkey="fast", block=1),
+        Miner(uid=9, hotkey="slow", block=1),
+    ]
+    captured_predictions = []
+
+    async def init_callback(miner, payload):
+        return {
+            "ready": True,
+            "miner_id": f"toy-{miner.hotkey}",
+            "session_id": f"miner-session-{miner.hotkey}",
+            "challenge_uid": payload.challenge_uid,
+            "utterance_id": payload.utterance_id,
+            "sample_rate_hz": payload.sample_rate_hz,
+            "frame_rate_hz": payload.frame_rate_hz,
+            "frame_samples": payload.frame_samples,
+            "dtype": payload.dtype,
+            "channels": payload.channels,
+        }
+
+    async def predict_callback(miner, payload):
+        if miner.hotkey == "slow":
+            await asyncio.sleep(0.03)
+        return {
+            "session_id": payload.session_id,
+            "audio_b64": payload.audio_b64,
+            "out_eos": True,
+            "n_bytes": len(base64.b64decode(payload.audio_b64))
+            if payload.audio_b64
+            else 0,
+        }
+
+    def fake_score_audio_utterance_batch(*, predictions, **_kwargs):
+        captured_predictions.extend(predictions)
+        return [
+            {
+                "score": 0.0,
+                "accuracy": 0.0,
+                "speech_rate": {},
+                "latency": {"completion_sec": pred["completion_sec"]},
+                "stt_text": "",
+                "gt_text": "",
+                "predicted_duration_sec": 0.0,
+                "effective_completion_sec": pred["completion_sec"],
+                "source_duration_sec": 0.0,
+                "score_is_fallback": False,
+                "score_method": "semantic_audio_v1",
+            }
+            for pred in predictions
+        ]
+
+    with (
+        patch(
+            "babelbit.utils.predict_audio.start_source_audio_session",
+            AsyncMock(return_value=start_payload),
+        ),
+        patch(
+            "babelbit.utils.predict_audio.next_source_audio_utterance",
+            AsyncMock(return_value=next_payload),
+        ),
+        patch(
+            "babelbit.utils.predict_audio.score_audio_utterance_batch",
+            side_effect=fake_score_audio_utterance_batch,
+        ),
+    ):
+        _challenge_uid, results = await predict_source_audio_multi_miner(
+            utterance_engine_url="http://ue.test",
+            miners=miners,
+            init_callback=init_callback,
+            predict_callback=predict_callback,
+            challenge_type="main",
+        )
+
+    assert results["fast"].utterances[0].completed is True
+    assert results["slow"].utterances[0].completed is True
+    assert captured_predictions[0]["completion_sec"] == pytest.approx(0.08)
+    assert captured_predictions[1]["completion_sec"] == pytest.approx(0.08)
+
+
+@pytest.mark.asyncio
 async def test_predict_source_audio_multi_miner_drains_until_out_eos():
     wav_bytes = _build_test_wav(sample_rate_hz=24_000, frame_count=3_840)
     start_payload = {
@@ -763,7 +867,7 @@ async def test_predict_source_audio_multi_miner_drains_until_out_eos():
     assert predict_calls[2]["audio_b64"] == ""
     assert predict_calls[-1]["in_eos"] is True
     assert results["hk1"].completed is True
-    assert results["hk1"].utterances[0].frame_count_out == 1
+    assert results["hk1"].utterances[0].frame_count_out == 2
 
 
 @pytest.mark.asyncio
@@ -2517,6 +2621,78 @@ def test_score_audio_utterance_batch_uses_speech_rate_penalty_key(tmp_path):
 
     assert scores[0]["speech_rate"]["penalty"] == 1.0
     assert scores[0]["score"] == 0.9
+
+
+def test_score_audio_utterance_batch_uses_measured_completion_time(tmp_path):
+    stt_cache_path = tmp_path / "stt_cache.jsonl"
+    mock_settings = SimpleNamespace(
+        BB_AUDIO_SCORING_STT_MODEL="faster-whisper-small",
+        BB_AUDIO_SCORING_STT_DEVICE="cpu",
+        BB_AUDIO_SCORING_EMBEDDER="all-MiniLM-L6-v2",
+        BB_AUDIO_SCORING_STT_CACHE_PATH=stt_cache_path,
+        BB_AUDIO_SCORING_ACC_WEIGHT=1.0,
+        BB_AUDIO_SCORING_SR_PENALTY_WEIGHT=1.0,
+        BB_AUDIO_SCORING_LATENCY_WEIGHT=1.0,
+    )
+    mock_metadata = SimpleNamespace(
+        reference_text="hello world",
+        reference_wps=2.0,
+        metadata_source="test-metadata",
+    )
+
+    with (
+        patch(
+            "babelbit.scoring.utterance_scoring.get_settings",
+            return_value=mock_settings,
+        ),
+        patch(
+            "babelbit.scoring.utterance_scoring.resolve_audio_reference_metadata",
+            return_value=mock_metadata,
+        ),
+        patch(
+            "babelbit.scoring.utterance_scoring.get_reference_embedding",
+            return_value=Mock(),
+        ),
+        patch(
+            "babelbit.scoring.utterance_scoring.transcribe_wav_bytes_batch",
+            return_value=[
+                {
+                    "text": "hello world",
+                    "words": [
+                        {"word": "hello", "start": 0.0, "end": 0.5},
+                        {"word": "world", "start": 0.5, "end": 1.0},
+                    ],
+                    "error": None,
+                }
+            ],
+        ),
+        patch(
+            "babelbit.scoring.utterance_scoring.compute_accuracy_batch",
+            return_value=[0.9],
+        ),
+        patch(
+            "babelbit.scoring.utterance_scoring._wav_duration_sec",
+            return_value=3.0,
+        ),
+    ):
+        scores = score_audio_utterance_batch(
+            predictions=[
+                {
+                    "predicted_wav_bytes": _build_test_wav(frame_count=8),
+                    "first_output_frame": 99,
+                    "frame_rate_hz": 1.0,
+                    "source_duration_sec": 1.0,
+                    "completion_sec": 1.25,
+                }
+            ],
+            challenge_uid="challenge-s2s",
+            utterance_id="challenge-s2s:0",
+            source_duration_sec=1.0,
+        )
+
+    assert scores[0]["predicted_duration_sec"] == 3.0
+    assert scores[0]["effective_completion_sec"] == 1.25
+    assert scores[0]["latency"]["completion_sec"] == 1.25
 
 
 def test_score_audio_utterance_batch_marks_stt_errors_as_fallback(tmp_path):

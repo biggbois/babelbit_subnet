@@ -4,6 +4,7 @@ from base64 import b64decode
 from traceback import print_exc
 import asyncio
 import os
+from pathlib import Path
 
 import click
 from substrateinterface import Keypair
@@ -31,17 +32,43 @@ async def reset_subtensor():
 
 def load_hotkey_keypair(wallet_name: str, hotkey_name: str) -> Keypair:
     settings = get_settings()
+    wallet_path = Path(settings.BITTENSOR_WALLET_PATH).expanduser()
 
-    file_path = settings.BITTENSOR_WALLET_PATH
+    try:
+        kwargs = {"name": wallet_name, "hotkey": hotkey_name}
+        if wallet_path.name != "wallets" or wallet_path.parent.name != ".bittensor":
+            kwargs["path"] = str(wallet_path)
+        bt_wallet = wallet(**kwargs)
+        keypair = bt_wallet.hotkey
+        logger.info(
+            "Loaded hotkey keypair from Bittensor wallet name=%s hotkey=%s path=%s",
+            wallet_name,
+            hotkey_name,
+            wallet_path,
+        )
+        return keypair
+    except Exception as wallet_exc:
+        logger.debug(
+            "Failed to load Bittensor wallet name=%s hotkey=%s path=%s: %s",
+            wallet_name,
+            hotkey_name,
+            wallet_path,
+            wallet_exc,
+        )
+
+    file_path = wallet_path
     try:
         with open(file_path, "r") as file:
             keypair_data = load(file)
         seed = keypair_data["secretSeed"]
         keypair = Keypair.create_from_seed(seed)
-        logger.info(f"Loaded keypair from {file_path}")
+        logger.info("Loaded hotkey keypair from keyfile %s", file_path)
         return keypair
     except Exception as e:
-        raise ValueError(f"Failed to load keypair: {str(e)}")
+        raise ValueError(
+            "Failed to load hotkey keypair from Bittensor wallet "
+            f"name={wallet_name!r} hotkey={hotkey_name!r} path={wallet_path}: {e}"
+        ) from e
 
 
 async def get_subtensor():

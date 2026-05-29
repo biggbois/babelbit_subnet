@@ -10,8 +10,12 @@ We are already ahead of SOTA on straight speech-to-speech translation but that i
 
 ## Babelbit: Bittensor SN59: PHASE 2 - Product Development
 For the last six months, since the subnet went live, we have been setting challenges for miners to prove one of the hypotheses which inspired our project to create a simultaneous translation system, capable of outperforming human interpreters. The particular human trait we focused on was prediction. Machine translation focuses on accuracy at the expense of latency, because until the advent of LLMs, neural networks were not that good at prediction. However, all human beings anticipate what is about to be said, when they listen to speech. Our hypothesis - now proven - was that LLMs can be trained for **phrase completion**, i.e. to predict beyond the next-word prediction which is the essential mechanism by which transformer networks generate output. 
-**
-That is, just like a person, can we start translating the phrase "May the Force be with you" after only hearing "May the Force...".**
+
+That is, just like a person, can we start translating a phrase, e.g.
+
+**"May the Force be with you"**
+
+after only hearing **"May the Force...".**
 
 Having proved that this is possible, we are now moving into a completely new type of competition. We are providing our current state-of-the art technology and rewarding miners for improving it. Things have been going very well, and our new workflow is something like this:
 1. We come up with a method we think is useful for speech-to-speech translation
@@ -80,7 +84,8 @@ As well as the a prebuilt miner we are giving you access to a bunch of our R&D.
 4. You could build your own from scratch
 
 Links:
-https://github.com/babelbit/babelbit_miner/tree/main/sample_code
+XXXXXXXXXXX
+XXXXXXXXXXX
 
 **Whichever way you do it, if you can improve the performance of our product, you will be handsomely rewarded**
 

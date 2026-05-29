@@ -125,7 +125,10 @@ def _build_bt_predict_headers(
     payload: BBAudioMinerInitPayload | BBAudioMinerPredictPayload,
 ) -> dict[str, str]:
     nonce = time.time_ns()
-    body_hash = ""
+    predict_payload = payload.model_dump(mode="json")
+    body_hash = hashlib.sha256(
+        dumps(predict_payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
     message = (
         f"{nonce}.{validator_identity['hotkey']}."
         f"{miner_hotkey}.{validator_identity['uuid']}.{body_hash}"
