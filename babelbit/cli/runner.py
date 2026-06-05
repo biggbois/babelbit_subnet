@@ -1,7 +1,7 @@
 import gc
 from datetime import datetime
 from functools import lru_cache
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 from logging import INFO, getLogger
 import os
 import sys
@@ -61,6 +61,72 @@ logger = getLogger(__name__)
 s3_manager: Optional[S3Manager] = None
 settings = get_settings()
 _DEFER_HTTP_CLIENT_CLOSE = False
+
+_ARENA_READY_ROUTE_STATUSES = {"running", "idle"}
+
+
+def _is_arena_route_ready(route: Optional[ManagedRoute]) -> bool:
+    if route is None:
+        return False
+    status = str(route.status or "").strip().lower()
+    return status in _ARENA_READY_ROUTE_STATUSES
+
+
+async def _resolve_round2_routes_when_ready(
+    *,
+    netuid: int,
+    subtensor,
+    ready_timeout_sec: float,
+    poll_sec: float,
+) -> Tuple[List[Miner], Dict[str, ManagedRoute]]:
+    deadline = time.monotonic() + max(0.0, float(ready_timeout_sec))
+    poll_interval = max(1.0, float(poll_sec))
+    while True:
+        arena_miners, routes_by_hotkey = await resolve_round2_routes(
+            netuid=netuid,
+            subtensor=subtensor,
+        )
+        ready_miners = [
+            miner
+            for miner in arena_miners
+            if _is_arena_route_ready(routes_by_hotkey.get(miner.hotkey))
+        ]
+
+        if arena_miners and len(ready_miners) == len(arena_miners):
+            if len(arena_miners) > 0:
+                logger.info(
+                    "All discovered Round2 routes are live: ready=%d total=%d",
+                    len(ready_miners),
+                    len(arena_miners),
+                )
+            return arena_miners, routes_by_hotkey
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if arena_miners:
+                logger.warning(
+                    "Round2 route readiness timeout expired: ready=%d total=%d; "
+                    "starting with live routes only",
+                    len(ready_miners),
+                    len(arena_miners),
+                )
+            ready_hotkeys = {miner.hotkey for miner in ready_miners}
+            return (
+                ready_miners,
+                {
+                    hotkey: route
+                    for hotkey, route in routes_by_hotkey.items()
+                    if hotkey in ready_hotkeys
+                },
+            )
+
+        logger.info(
+            "Waiting for Round2 routes to become live: ready=%d total=%d timeout_remaining=%.1fs",
+            len(ready_miners),
+            len(arena_miners),
+            remaining,
+        )
+        await asyncio.sleep(min(poll_interval, remaining))
 
 
 async def get_subtensor():
@@ -181,6 +247,13 @@ def _resolve_s2s_audio_timeouts(
         default=max(60.0, miner_timeout),
     )
     return miner_timeout, init_timeout
+
+
+def _is_first_audio_utterance(payload: object) -> bool:
+    utterance_id = str(getattr(payload, "utterance_id", "") or "").strip()
+    if not utterance_id:
+        return True
+    return utterance_id == "0" or utterance_id.endswith(":0")
 
 
 def _format_profile_seconds(value: Optional[float]) -> str:
@@ -420,12 +493,17 @@ def _build_axon_audio_callbacks(
     init_request_timeout = init_timeout if init_timeout is not None else miner_timeout
 
     async def init_callback(miner: Miner, payload: BBAudioMinerInitPayload) -> dict:
+        request_timeout = (
+            init_request_timeout
+            if _is_first_audio_utterance(payload)
+            else miner_timeout
+        )
         response = await call_miner_axon_audio_endpoint(
             axon_ip=miner.axon_ip or "",
             axon_port=int(miner.axon_port or 0),
             payload=payload,
             miner_hotkey=miner.hotkey,
-            timeout=init_request_timeout,
+            timeout=request_timeout,
         )
         if "error" in response:
             raise RuntimeError(str(response["error"]))
@@ -464,11 +542,26 @@ def _build_round2_audio_callbacks(
             raise RuntimeError(
                 f"Miner {getattr(miner, 'uid', '?')} has no managed route"
             )
+        if getattr(route, "miner_uid", None) is None:
+            route.miner_uid = getattr(miner, "uid", None)
+        logger.info(
+            "Round2 managed init dispatch uid=%s hotkey=%s provider=%s status=%s endpoint_url=%s",
+            getattr(miner, "uid", "?"),
+            (str(getattr(miner, "hotkey", ""))[:16] + "..."),
+            getattr(route, "provider", ""),
+            getattr(route, "status", ""),
+            getattr(route, "endpoint_url", ""),
+        )
+        request_timeout = (
+            init_request_timeout
+            if _is_first_audio_utterance(payload)
+            else miner_timeout
+        )
         response = await call_managed_route_audio_endpoint(
             route=route,
             payload=payload,
             miner_hotkey=miner.hotkey,
-            timeout=init_request_timeout,
+            timeout=request_timeout,
         )
         if "error" in response:
             raise RuntimeError(str(response["error"]))
@@ -482,6 +575,16 @@ def _build_round2_audio_callbacks(
             raise RuntimeError(
                 f"Miner {getattr(miner, 'uid', '?')} has no managed route"
             )
+        if getattr(route, "miner_uid", None) is None:
+            route.miner_uid = getattr(miner, "uid", None)
+        logger.info(
+            "Round2 managed predict dispatch uid=%s hotkey=%s provider=%s status=%s endpoint_url=%s",
+            getattr(miner, "uid", "?"),
+            (str(getattr(miner, "hotkey", ""))[:16] + "..."),
+            getattr(route, "provider", ""),
+            getattr(route, "status", ""),
+            getattr(route, "endpoint_url", ""),
+        )
         response = await call_managed_route_audio_endpoint(
             route=route,
             payload=payload,
@@ -989,13 +1092,17 @@ async def runner_round2(
 
     try:
         _stderr_boot("runner arena resolving managed routes")
-        arena_miners, routes_by_hotkey = await resolve_round2_routes(
+        arena_miners, routes_by_hotkey = await _resolve_round2_routes_when_ready(
             netuid=NETUID,
             subtensor=subtensor,
+            ready_timeout_sec=float(
+                getattr(settings, "BB_ARENA_ROUTE_READY_TIMEOUT_SEC", 300)
+            ),
+            poll_sec=float(getattr(settings, "BB_ARENA_ROUTE_READY_POLL_SEC", 10)),
         )
         if not arena_miners:
-            _stderr_boot("runner arena no eligible managed miners")
-            logger.warning("No eligible managed miners found for arena.")
+            _stderr_boot("runner arena no live managed miners")
+            logger.warning("No live managed miners found for arena.")
             return
 
         random.shuffle(arena_miners)

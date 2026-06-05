@@ -20,6 +20,17 @@ from babelbit.utils.settings import get_settings
 
 logger = getLogger(__name__)
 
+_ROUTE_STATUS_PRIORITY = {
+    "running": 0,
+    "idle": 1,
+    "warming": 2,
+    "unhealthy": 3,
+    "stopped": 4,
+    "terminated": 5,
+    "unavailable": 6,
+    "failed": 7,
+}
+
 
 @dataclass
 class ManagedRoute:
@@ -130,6 +141,11 @@ def _is_soft_terminated_route(item: Dict[str, Any]) -> bool:
         return False
     endpoint_url = _extract_endpoint_url(item)
     return bool(endpoint_url)
+
+
+def _route_status_priority(route: ManagedRoute) -> int:
+    status = str(route.status or "").strip().lower()
+    return _ROUTE_STATUS_PRIORITY.get(status, 99)
 
 
 def _extract_provider(
@@ -520,6 +536,18 @@ async def fetch_live_containers(
             url,
             ",".join(status_filters),
         )
+        if merged_containers:
+            preview = []
+            for item in merged_containers[:5]:
+                preview.append(
+                    {
+                        "hotkey": str(item.get("miner_hotkey") or item.get("hotkey") or "")[:16],
+                        "provider": item.get("provider"),
+                        "status": item.get("status"),
+                        "endpoint_url": item.get("endpoint_url") or item.get("url"),
+                    }
+                )
+            logger.info("Round2 managed route discovery preview: %s", preview)
         return merged_containers
 
     if last_404_error is not None:
@@ -587,11 +615,28 @@ async def resolve_round2_routes(
             route.miner_uid = matched_miner.uid
 
         if route.miner_hotkey in hotkey_to_route:
-            logger.warning(
-                "Duplicate Round2 route for hotkey=%s; keeping first endpoint=%s",
-                route.miner_hotkey,
-                hotkey_to_route[route.miner_hotkey].endpoint_url,
-            )
+            existing_route = hotkey_to_route[route.miner_hotkey]
+            if _route_status_priority(route) < _route_status_priority(existing_route):
+                logger.warning(
+                    "Duplicate Round2 route for hotkey=%s; replacing status=%s endpoint=%s "
+                    "with better status=%s endpoint=%s",
+                    route.miner_hotkey,
+                    existing_route.status,
+                    existing_route.endpoint_url,
+                    route.status,
+                    route.endpoint_url,
+                )
+                hotkey_to_route[route.miner_hotkey] = route
+            else:
+                logger.warning(
+                    "Duplicate Round2 route for hotkey=%s; keeping status=%s endpoint=%s "
+                    "over status=%s endpoint=%s",
+                    route.miner_hotkey,
+                    existing_route.status,
+                    existing_route.endpoint_url,
+                    route.status,
+                    route.endpoint_url,
+                )
             continue
 
         endpoint_source_key = _detect_endpoint_source_key(normalized_item) or "unknown"

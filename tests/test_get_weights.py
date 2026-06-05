@@ -602,7 +602,7 @@ async def test_fetch_scores_from_api_success(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_fetch_scores_from_api_includes_challenge_type(monkeypatch):
-    """challenge_type should be sent as mapped query param, not signed payload."""
+    """Qualifying challenge_type stays query-only for backward compatibility."""
     from babelbit.cli import validate as validate_mod
 
     fake_session = MockSession(
@@ -653,7 +653,13 @@ async def test_fetch_scores_from_api_maps_arena_challenge_type(monkeypatch):
     monkeypatch.setattr(
         validate_mod, "get_async_client", AsyncMock(return_value=fake_session)
     )
-    monkeypatch.setattr(validate_mod, "sign_message", lambda *_args, **_kwargs: "sig")
+    canonical_holder = {}
+
+    def fake_sign(kp, canonical):
+        canonical_holder["payload"] = canonical
+        return "sig"
+
+    monkeypatch.setattr(validate_mod, "sign_message", fake_sign)
 
     _ = await validate_mod.fetch_scores_from_api(
         base_url="http://submit-api",
@@ -665,6 +671,11 @@ async def test_fetch_scores_from_api_maps_arena_challenge_type(monkeypatch):
     _, params, kwargs = fake_session.get_calls[0]
     assert params["challenge_type"] == "arena"
     assert kwargs["timeout"].total == 30.0
+
+    parsed = json.loads(canonical_holder["payload"])
+    assert parsed["challenge_type"] == "arena"
+    assert parsed["data"]["challenge_uid"] == "chal-xyz"
+    assert parsed["data"]["challenge_type"] == "arena"
 
 
 @pytest.mark.asyncio
@@ -813,7 +824,7 @@ async def test_retry_set_weights_falls_back_on_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_retry_set_weights_skips_local_fallback_on_confirmation_failed(
+async def test_retry_set_weights_falls_back_on_confirmation_failed(
     monkeypatch,
 ):
     from babelbit.cli import validate as validate_mod
@@ -839,5 +850,12 @@ async def test_retry_set_weights_skips_local_fallback_on_confirmation_failed(
 
     ok = await validate_mod.retry_set_weights(wallet="wallet", uids=[6], weights=[1.0])
 
-    assert ok is False
-    assert fallback.await_count == 0
+    assert ok is True
+    fallback.assert_awaited_once_with(
+        wallet="wallet",
+        netuid=7,
+        uids=[6],
+        weights=[1.0],
+        retries=20,
+        delay_s=2.0,
+    )

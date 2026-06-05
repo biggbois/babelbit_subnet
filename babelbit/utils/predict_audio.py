@@ -144,6 +144,27 @@ class _MinerUtteranceSession:
     completed_frame: Optional[int] = None
 
 
+def _build_miner_init_payload(
+    *,
+    ue_utterance: BBAudioUEUtterance,
+    miner_audio: _MinerAudio,
+) -> BBAudioMinerInitPayload:
+    frame_samples = _default_frame_samples(miner_audio.sample_rate_hz)
+    return BBAudioMinerInitPayload(
+        challenge_uid=ue_utterance.challenge_uid,
+        utterance_id=ue_utterance.utterance_id,
+        language=ue_utterance.language,
+        sample_rate_hz=miner_audio.sample_rate_hz,
+        frame_samples=frame_samples,
+        frame_rate_hz=_default_frame_rate_hz(
+            miner_audio.sample_rate_hz,
+            frame_samples,
+        ),
+        dtype=miner_audio.dtype,
+        channels=miner_audio.channels,
+    )
+
+
 async def _await_predict_response(
     *,
     miner: Any,
@@ -651,19 +672,9 @@ async def _start_utterance_for_miner(
     init_callback: Callable[[Any, BBAudioMinerInitPayload], Awaitable[Dict[str, Any]]],
 ) -> _MinerUtteranceSession:
     miner_audio = _decoded_audio_to_miner_audio(decoded_audio)
-    frame_samples = _default_frame_samples(miner_audio.sample_rate_hz)
-    init_payload = BBAudioMinerInitPayload(
-        challenge_uid=ue_utterance.challenge_uid,
-        utterance_id=ue_utterance.utterance_id,
-        language=ue_utterance.language,
-        sample_rate_hz=miner_audio.sample_rate_hz,
-        frame_samples=frame_samples,
-        frame_rate_hz=_default_frame_rate_hz(
-            miner_audio.sample_rate_hz,
-            frame_samples,
-        ),
-        dtype=miner_audio.dtype,
-        channels=miner_audio.channels,
+    init_payload = _build_miner_init_payload(
+        ue_utterance=ue_utterance,
+        miner_audio=miner_audio,
     )
     started_at = perf_counter()
     init_response_data = await init_callback(miner, init_payload)
@@ -716,6 +727,122 @@ async def _start_utterance_for_miner(
         ),
         output_chunks=[],
     )
+
+
+async def _start_utterances_with_keepalive(
+    *,
+    miners: List[Any],
+    ue_utterance: BBAudioUEUtterance,
+    decoded_audio: _DecodedWav,
+    source_audio_bytes: bytes,
+    init_callback: Callable[[Any, BBAudioMinerInitPayload], Awaitable[Dict[str, Any]]],
+    keepalive_enabled: bool,
+    keepalive_interval_seconds: float,
+    init_barrier_timeout_seconds: float | None = None,
+) -> List[Any]:
+    tasks: Dict[asyncio.Task, Any] = {
+        asyncio.create_task(
+            _start_utterance_for_miner(
+                miner=miner,
+                ue_utterance=ue_utterance,
+                decoded_audio=decoded_audio,
+                source_audio_bytes=source_audio_bytes,
+                init_callback=init_callback,
+            )
+        ): miner
+        for miner in miners
+    }
+    results_by_hotkey: Dict[str, Any] = {}
+    ready_sessions: Dict[str, _MinerUtteranceSession] = {}
+    started_at = perf_counter()
+    last_keepalive_at = perf_counter()
+    interval = max(1.0, keepalive_interval_seconds)
+    barrier_timeout = (
+        max(0.0, float(init_barrier_timeout_seconds))
+        if init_barrier_timeout_seconds is not None
+        else 0.0
+    )
+
+    while tasks:
+        wait_timeout = interval if keepalive_enabled and ready_sessions else None
+        if barrier_timeout > 0.0:
+            remaining_barrier = barrier_timeout - (perf_counter() - started_at)
+            if remaining_barrier <= 0.0:
+                logger.info(
+                    "S2S audio init barrier reached: challenge=%s utterance=%s pending_miners=%d timeout_s=%.2f",
+                    ue_utterance.challenge_uid,
+                    ue_utterance.utterance_id,
+                    len(tasks),
+                    barrier_timeout,
+                )
+                barrier_exc = AudioChallengeError(
+                    f"Arena init barrier exceeded after {barrier_timeout:.2f}s"
+                )
+                pending_items = list(tasks.items())
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks.keys(), return_exceptions=True)
+                for task, miner in pending_items:
+                    tasks.pop(task, None)
+                    hotkey = str(getattr(miner, "hotkey", ""))
+                    results_by_hotkey[hotkey] = barrier_exc
+                break
+            wait_timeout = (
+                remaining_barrier
+                if wait_timeout is None
+                else min(wait_timeout, remaining_barrier)
+            )
+        done, pending = await asyncio.wait(
+            tasks.keys(),
+            timeout=wait_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in done:
+            miner = tasks.pop(task)
+            hotkey = str(getattr(miner, "hotkey", ""))
+            try:
+                result = task.result()
+            except BaseException as exc:  # noqa: BLE001
+                results_by_hotkey[hotkey] = exc
+                continue
+            results_by_hotkey[hotkey] = result
+            if isinstance(result, _MinerUtteranceSession):
+                ready_sessions[hotkey] = result
+
+        if not pending or not keepalive_enabled or not ready_sessions:
+            continue
+        now = perf_counter()
+        if now - last_keepalive_at < interval:
+            continue
+        last_keepalive_at = now
+        keepalive_tasks = []
+        for session in ready_sessions.values():
+            init_payload = _build_miner_init_payload(
+                ue_utterance=session.ue_utterance,
+                miner_audio=session.miner_audio,
+            )
+            keepalive_tasks.append(init_callback(session.miner, init_payload))
+        keepalive_results = await asyncio.gather(*keepalive_tasks, return_exceptions=True)
+        for session, keepalive_result in zip(ready_sessions.values(), keepalive_results):
+            if isinstance(keepalive_result, BaseException):
+                logger.info(
+                    "S2S audio init keepalive failed while waiting for cold miners: challenge=%s utterance=%s %s error=%s:%s",
+                    session.ue_utterance.challenge_uid,
+                    session.ue_utterance.utterance_id,
+                    _miner_log_label(session.miner),
+                    type(keepalive_result).__name__,
+                    keepalive_result,
+                )
+            else:
+                logger.info(
+                    "S2S audio init keepalive sent while waiting for cold miners: challenge=%s utterance=%s %s pending_miners=%d",
+                    session.ue_utterance.challenge_uid,
+                    session.ue_utterance.utterance_id,
+                    _miner_log_label(session.miner),
+                    len(pending),
+                )
+
+    return [results_by_hotkey.get(str(getattr(miner, "hotkey", ""))) for miner in miners]
 
 
 async def _predict_frame_for_miner(
@@ -788,6 +915,7 @@ async def _drain_miner_until_eos(
     *,
     max_requests: int,
     global_timeout_seconds: float,
+    min_timeout_seconds: float,
     predict_callback: Callable[
         [Any, BBAudioMinerPredictPayload], Awaitable[Dict[str, Any]]
     ],
@@ -804,7 +932,11 @@ async def _drain_miner_until_eos(
         )
 
     total_frames = len(session.input_frames)
-    drain_deadline = session.last_input_chunk_sent_at + global_timeout_seconds
+    drain_started_at = perf_counter()
+    drain_deadline = max(
+        session.last_input_chunk_sent_at + global_timeout_seconds,
+        drain_started_at + max(0.0, min_timeout_seconds),
+    )
     for drain_index in range(max_requests):
         remaining_timeout = drain_deadline - perf_counter()
         if remaining_timeout <= 0:
@@ -1013,6 +1145,10 @@ async def predict_source_audio_multi_miner(
         logger.info("S2S audio session completed immediately with no utterances")
         return challenge_uid, {}
 
+    session_id = current_utterance.session_id
+    prefetched_utterances: List[BBAudioUEUtterance] = [current_utterance]
+    challenge_error: str | None = None
+
     transcription_metadata: Optional[Dict[str, Any]] = None
     transcription_metadata_source = f"{utterance_engine_url.rstrip('/')}/transcription"
     if not is_solo_challenge:
@@ -1063,12 +1199,46 @@ async def predict_source_audio_multi_miner(
                 first_payload_keys,
             )
 
+    prefetch_cursor = current_utterance
+    while prefetch_cursor is not None and not prefetch_cursor.done:
+        try:
+            next_data = (
+                await next_solo_audio_utterance(utterance_engine_url, session_id)
+                if is_solo_challenge
+                else await next_source_audio_utterance(utterance_engine_url, session_id)
+            )
+            ue_utterance_payloads.append(next_data)
+            if (
+                transcription_metadata_source
+                == f"{utterance_engine_url.rstrip('/')}/source-audio"
+            ):
+                updated_inline_metadata = _inline_metadata_from_ue_payloads(
+                    challenge_uid=challenge_uid,
+                    payloads=ue_utterance_payloads,
+                )
+                if updated_inline_metadata is not None:
+                    transcription_metadata = updated_inline_metadata
+            prefetch_cursor = _response_to_ue_utterance(next_data)
+            if prefetch_cursor is not None:
+                prefetched_utterances.append(prefetch_cursor)
+        except Exception as exc:
+            challenge_error = f"{type(exc).__name__}:{exc}"
+            logger.warning(
+                "S2S audio session aborted while prefetching source utterances: challenge=%s session=%s utterances_prefetched=%d error=%s",
+                challenge_uid,
+                session_id,
+                len(prefetched_utterances),
+                challenge_error,
+            )
+            break
+
     logger.info(
-        "S2S audio session started: challenge=%s session=%s miners=%d first_utterance=%s",
+        "S2S audio session started: challenge=%s session=%s miners=%d first_utterance=%s prefetched_utterances=%d",
         challenge_uid,
-        current_utterance.session_id,
+        session_id,
         len(miners),
         current_utterance.utterance_id,
+        len(prefetched_utterances),
     )
 
     results: Dict[str, BBAudioChallengeResult] = {
@@ -1081,10 +1251,9 @@ async def predict_source_audio_multi_miner(
         for miner in miners
     }
 
-    session_id = current_utterance.session_id
     total_miner_serving_seconds = 0.0
     total_scoring_seconds = 0.0
-    challenge_error: str | None = None
+    active_miners = list(miners)
     settings = get_settings()
     max_drain_requests = max(0, int(getattr(settings, "BB_S2S_DRAIN_MAX_REQUESTS", 8)))
     chunk_response_timeout_seconds = max(
@@ -1093,8 +1262,30 @@ async def predict_source_audio_multi_miner(
     drain_timeout_seconds = max(
         0.001, float(getattr(settings, "BB_S2S_DRAIN_TIMEOUT_SEC", 10.0))
     )
+    min_final_drain_timeout_seconds = max(
+        0.0,
+        float(getattr(settings, "BB_S2S_FINAL_DRAIN_MIN_TIMEOUT_SEC", 5.0)),
+    )
+    init_keepalive_enabled = str(
+        getattr(settings, "BB_ARENA_INIT_KEEPALIVE_ENABLED", "true")
+    ).strip().lower() not in {"0", "false", "no", "off"}
+    init_keepalive_interval_seconds = max(
+        1.0,
+        float(getattr(settings, "BB_ARENA_INIT_KEEPALIVE_INTERVAL_SEC", 30.0)),
+    )
+    arena_init_barrier_timeout_seconds = max(
+        0.0,
+        float(getattr(settings, "BB_ARENA_INIT_BARRIER_TIMEOUT_SEC", 600.0)),
+    )
 
-    while current_utterance is not None:
+    for utterance_position, current_utterance in enumerate(prefetched_utterances):
+        if not active_miners:
+            logger.info(
+                "S2S audio session stopping early: challenge=%s session=%s no_active_miners=True",
+                challenge_uid,
+                session_id,
+            )
+            break
         raw_audio_bytes = base64.b64decode(current_utterance.audio_b64)
         decoded_audio = _decode_audio_bytes(
             raw_audio_bytes,
@@ -1124,25 +1315,27 @@ async def predict_source_audio_multi_miner(
         )
         serving_started_at = perf_counter()
         miner_started_at = {
-            str(getattr(miner, "hotkey", "")): perf_counter() for miner in miners
+            str(getattr(miner, "hotkey", "")): perf_counter()
+            for miner in active_miners
         }
-        start_results = await asyncio.gather(
-            *(
-                _start_utterance_for_miner(
-                    miner=miner,
-                    ue_utterance=current_utterance,
-                    decoded_audio=decoded_audio,
-                    source_audio_bytes=source_audio_bytes,
-                    init_callback=init_callback,
-                )
-                for miner in miners
+        start_results = await _start_utterances_with_keepalive(
+            miners=active_miners,
+            ue_utterance=current_utterance,
+            decoded_audio=decoded_audio,
+            source_audio_bytes=source_audio_bytes,
+            init_callback=init_callback,
+            keepalive_enabled=(challenge_type == "arena" and init_keepalive_enabled),
+            keepalive_interval_seconds=init_keepalive_interval_seconds,
+            init_barrier_timeout_seconds=(
+                arena_init_barrier_timeout_seconds
+                if challenge_type == "arena"
+                else None
             ),
-            return_exceptions=True,
         )
 
         active_sessions: List[_MinerUtteranceSession] = []
         prediction_by_hotkey: Dict[str, _RawPrediction] = {}
-        for miner, start_result in zip(miners, start_results):
+        for miner, start_result in zip(active_miners, start_results):
             if isinstance(start_result, BaseException):
                 prediction_by_hotkey[str(getattr(miner, "hotkey", ""))] = (
                     _prediction_failure(
@@ -1216,6 +1409,7 @@ async def predict_source_audio_multi_miner(
                         session,
                         max_requests=max_drain_requests,
                         global_timeout_seconds=drain_timeout_seconds,
+                        min_timeout_seconds=min_final_drain_timeout_seconds,
                         predict_callback=predict_callback,
                     )
                     for session in drain_sessions
@@ -1263,7 +1457,8 @@ async def predict_source_audio_multi_miner(
                 )
 
         raw_predictions = [
-            prediction_by_hotkey[str(getattr(miner, "hotkey", ""))] for miner in miners
+            prediction_by_hotkey[str(getattr(miner, "hotkey", ""))]
+            for miner in active_miners
         ]
         total_miner_serving_seconds += perf_counter() - serving_started_at
 
@@ -1410,6 +1605,29 @@ async def predict_source_audio_multi_miner(
             successful_miners,
             len(utterance_results) - successful_miners,
         )
+        if challenge_type == "arena" and utterance_position == 0:
+            successful_hotkeys = {
+                result.miner_hotkey for result in utterance_results if result.completed
+            }
+            dropped_miners = [
+                miner
+                for miner in active_miners
+                if str(getattr(miner, "hotkey", "")) not in successful_hotkeys
+            ]
+            if dropped_miners:
+                logger.info(
+                    "S2S audio arena dropped miners after first utterance failure: challenge=%s utterance=%s dropped=%d kept=%d dropped_uids=%s",
+                    current_utterance.challenge_uid,
+                    current_utterance.utterance_id,
+                    len(dropped_miners),
+                    len(successful_hotkeys),
+                    ",".join(str(getattr(miner, "uid", -1)) for miner in dropped_miners),
+                )
+                active_miners = [
+                    miner
+                    for miner in active_miners
+                    if str(getattr(miner, "hotkey", "")) in successful_hotkeys
+                ]
 
         if current_utterance.done:
             logger.info(
@@ -1417,34 +1635,6 @@ async def predict_source_audio_multi_miner(
                 current_utterance.challenge_uid,
                 session_id,
                 current_utterance.utterance_id,
-            )
-            break
-
-        try:
-            next_data = (
-                await next_solo_audio_utterance(utterance_engine_url, session_id)
-                if is_solo_challenge
-                else await next_source_audio_utterance(utterance_engine_url, session_id)
-            )
-            ue_utterance_payloads.append(next_data)
-            if (
-                transcription_metadata_source
-                == f"{utterance_engine_url.rstrip('/')}/source-audio"
-            ):
-                updated_inline_metadata = _inline_metadata_from_ue_payloads(
-                    challenge_uid=challenge_uid,
-                    payloads=ue_utterance_payloads,
-                )
-                if updated_inline_metadata is not None:
-                    transcription_metadata = updated_inline_metadata
-            current_utterance = _response_to_ue_utterance(next_data)
-        except Exception as exc:
-            challenge_error = f"{type(exc).__name__}:{exc}"
-            logger.warning(
-                "S2S audio session aborted while fetching next utterance: challenge=%s session=%s error=%s",
-                challenge_uid,
-                session_id,
-                challenge_error,
             )
             break
 

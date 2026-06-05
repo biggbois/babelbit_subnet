@@ -30,6 +30,7 @@ class Settings(BaseModel):
     BB_S2S_INIT_TIMEOUT_SEC: float
     BB_S2S_CHUNK_TIMEOUT_SEC: float
     BB_S2S_DRAIN_TIMEOUT_SEC: float
+    BB_S2S_FINAL_DRAIN_MIN_TIMEOUT_SEC: float
     BB_S2S_DRAIN_MAX_REQUESTS: int
     BB_UTTERANCE_ENGINE_URL: str
     BB_AUDIO_SCORING_METADATA_ROOT: Optional[Path] = None
@@ -54,8 +55,14 @@ class Settings(BaseModel):
     BB_ARENA_CONTAINERS_STATUS: str
     BB_ARENA_CONTAINERS_WINDOW_SECONDS: int
     BB_ARENA_CONTAINERS_TIMEOUT_SEC: int
+    BB_ARENA_ROUTE_READY_TIMEOUT_SEC: float
+    BB_ARENA_ROUTE_READY_POLL_SEC: float
     BB_ARENA_RUNSYNC_API_PATH: str
     BB_ARENA_GATEWAY_AUTH_API_PATH: str
+    BB_ARENA_GATEWAY_TIMEOUT_SEC: float
+    BB_ARENA_INIT_BARRIER_TIMEOUT_SEC: float
+    BB_ARENA_INIT_KEEPALIVE_ENABLED: bool
+    BB_ARENA_INIT_KEEPALIVE_INTERVAL_SEC: float
     BB_ARENA_MINER_TIMEOUT_SEC: int
     BB_ARENA_INCENTIVE_PERCENT: float = 90.0
 
@@ -139,9 +146,12 @@ def get_settings() -> Settings:
         ),
         BB_MINER_PREDICT_ENDPOINT=getenv("BB_MINER_PREDICT_ENDPOINT", "v1/predict"),
         BB_MINER_TIMEOUT_SEC=int(getenv("BB_MINER_TIMEOUT_SEC", "10")),
-        BB_S2S_INIT_TIMEOUT_SEC=float(getenv("BB_S2S_INIT_TIMEOUT_SEC", "60")),
+        BB_S2S_INIT_TIMEOUT_SEC=float(getenv("BB_S2S_INIT_TIMEOUT_SEC", "600")),
         BB_S2S_CHUNK_TIMEOUT_SEC=float(getenv("BB_S2S_CHUNK_TIMEOUT_SEC", "3")),
         BB_S2S_DRAIN_TIMEOUT_SEC=float(getenv("BB_S2S_DRAIN_TIMEOUT_SEC", "10")),
+        BB_S2S_FINAL_DRAIN_MIN_TIMEOUT_SEC=float(
+            getenv("BB_S2S_FINAL_DRAIN_MIN_TIMEOUT_SEC", "5")
+        ),
         BB_S2S_DRAIN_MAX_REQUESTS=int(getenv("BB_S2S_DRAIN_MAX_REQUESTS", "8")),
         BB_UTTERANCE_ENGINE_URL=getenv(
             "BB_UTTERANCE_ENGINE_URL", "https://api.babelbit.ai"
@@ -215,9 +225,30 @@ def get_settings() -> Settings:
         BB_ARENA_CONTAINERS_TIMEOUT_SEC=int(
             getenv("BB_ARENA_CONTAINERS_TIMEOUT_SEC", "10")
         ),
+        BB_ARENA_ROUTE_READY_TIMEOUT_SEC=float(
+            getenv("BB_ARENA_ROUTE_READY_TIMEOUT_SEC", "300")
+        ),
+        BB_ARENA_ROUTE_READY_POLL_SEC=float(
+            getenv("BB_ARENA_ROUTE_READY_POLL_SEC", "10")
+        ),
         BB_ARENA_RUNSYNC_API_PATH=getenv("BB_ARENA_RUNSYNC_API_PATH", "/runsync"),
         BB_ARENA_GATEWAY_AUTH_API_PATH=getenv(
             "BB_ARENA_GATEWAY_AUTH_API_PATH", "/auth/token"
+        ),
+        BB_ARENA_GATEWAY_TIMEOUT_SEC=float(
+            getenv("BB_ARENA_GATEWAY_TIMEOUT_SEC", "300")
+        ),
+        BB_ARENA_INIT_BARRIER_TIMEOUT_SEC=float(
+            getenv("BB_ARENA_INIT_BARRIER_TIMEOUT_SEC", "600")
+        ),
+        BB_ARENA_INIT_KEEPALIVE_ENABLED=getenv(
+            "BB_ARENA_INIT_KEEPALIVE_ENABLED", "true"
+        )
+        .strip()
+        .lower()
+        not in {"0", "false", "no", "off"},
+        BB_ARENA_INIT_KEEPALIVE_INTERVAL_SEC=float(
+            getenv("BB_ARENA_INIT_KEEPALIVE_INTERVAL_SEC", "30")
         ),
         BB_ARENA_MINER_TIMEOUT_SEC=int(getenv("BB_ARENA_MINER_TIMEOUT_SEC", "10")),
         BB_ARENA_INCENTIVE_PERCENT=float(getenv("BB_ARENA_INCENTIVE_PERCENT", "90")),
@@ -238,7 +269,7 @@ def get_settings() -> Settings:
         ),
         SUBTENSOR_GATEWAY_HOST=getenv("SUBTENSOR_GATEWAY_HOST", "0.0.0.0"),
         SUBTENSOR_GATEWAY_PORT=int(getenv("SUBTENSOR_GATEWAY_PORT", "8090")),
-        SUBTENSOR_GATEWAY_TIMEOUT_S=int(getenv("SUBTENSOR_GATEWAY_TIMEOUT_S", "30")),
+        SUBTENSOR_GATEWAY_TIMEOUT_S=int(getenv("SUBTENSOR_GATEWAY_TIMEOUT_S", "300")),
         # Database settings
         PG_HOST=getenv("PG_HOST", "db"),
         PG_PORT=int(getenv("PG_PORT", "5432")),

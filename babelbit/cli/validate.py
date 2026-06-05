@@ -570,6 +570,9 @@ async def fetch_scores_from_api(
         "challenge_id": challenge_uid,
         "data": {"challenge_uid": challenge_uid},
     }
+    if api_challenge_type == "arena":
+        payload["challenge_type"] = api_challenge_type
+        payload["data"]["challenge_type"] = api_challenge_type
     canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)
     signature_hex = sign_message(validator_kp, canonical)
 
@@ -652,11 +655,13 @@ async def retry_set_weights(wallet, uids, weights):
             if resp.status == 200 and data.get("success"):
                 return True
             if data.get("error") == "confirmation failed":
-                logger.info(
-                    "Signer could not confirm set_weights; skipping duplicate local fallback"
+                logger.warning(
+                    "Signer could not confirm set_weights; falling back to gateway "
+                    "set_weights confirmation (body=%s)",
+                    data,
                 )
-                return False
-            logger.warning(f"Signer error status={resp.status} body={data}")
+            else:
+                logger.warning("Signer error status=%s body=%s", resp.status, data)
     except aiohttp.ClientConnectorError as e:
         logger.info(f"Signer unreachable: {e} — falling back to local set_weights")
     except asyncio.TimeoutError:

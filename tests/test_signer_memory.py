@@ -54,8 +54,8 @@ class TestSubtensorLifecycle:
     async def test_gateway_called_once(self, mock_wallet):
         """Signer should delegate one request to gateway for each operation."""
         with patch(
-            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm",
-            new=AsyncMock(return_value=True),
+            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm_response",
+            new=AsyncMock(return_value={"success": True}),
         ) as call:
             ok = await _set_weights_with_confirmation(
                 wallet=mock_wallet,
@@ -73,7 +73,7 @@ class TestSubtensorLifecycle:
     @pytest.mark.asyncio
     async def test_gateway_failure_returns_false(self, mock_wallet):
         with patch(
-            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm",
+            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm_response",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ):
             result = await _set_weights_with_confirmation(
@@ -309,10 +309,10 @@ class TestProductionWorkloads:
         async def fake_gateway(*args, **kwargs):
             nonlocal call_count
             call_count += 1
-            return call_count % 3 == 0
+            return {"success": call_count % 3 == 0}
 
         with patch(
-            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm",
+            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm_response",
             new=AsyncMock(side_effect=fake_gateway),
         ):
             for _ in range(50):
@@ -393,8 +393,8 @@ class TestMemoryLeakMitigation:
             reset_calls.append(operation_count)
 
         with patch(
-            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm",
-            new=AsyncMock(return_value=True),
+            "babelbit.cli.signer_api.SubtensorGatewayClient.set_weights_and_confirm_response",
+            new=AsyncMock(return_value={"success": True}),
         ):
             for i in range(15):
                 await _set_weights_with_confirmation(

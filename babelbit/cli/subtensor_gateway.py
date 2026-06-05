@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 import socket
@@ -166,6 +167,31 @@ def _serialize_commitments(commits: dict[str, Any]) -> dict[str, list[list[Any]]
     return out
 
 
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _set_weights_result(result: Any) -> tuple[bool, str | None]:
+    if isinstance(result, tuple):
+        success = bool(result[0]) if result else False
+        message = str(result[1]) if len(result) > 1 else None
+        return success, message
+    return bool(result), None
+
+
+def _top_nonzero_weights(
+    uids: list[int], weights: list[float], *, limit: int = 10
+) -> list[dict[str, Any]]:
+    pairs = [
+        {"uid": int(uid), "weight": float(weight)}
+        for uid, weight in zip(uids, weights)
+        if float(weight) > 0.0
+    ]
+    return sorted(pairs, key=lambda item: item["weight"], reverse=True)[:limit]
+
+
 async def run_subtensor_gateway() -> None:
     settings = get_settings()
     host = settings.SUBTENSOR_GATEWAY_HOST
@@ -267,28 +293,93 @@ async def run_subtensor_gateway() -> None:
                 status=400,
             )
 
+        last_details = {
+            "wallet_hotkey": wallet_hotkey,
+            "uid_count": len(uids),
+            "nonzero_weights": sum(1 for w in weights if float(w) > 0.0),
+            "top_weights": _top_nonzero_weights(uids, weights),
+        }
         for attempt in range(retries):
             try:
                 st = await STATE.get_subtensor()
                 ref = await st.get_current_block()
-                success = await st.set_weights(
+                last_details.update({"ref_block": int(ref), "attempt": attempt + 1})
+                commit_reveal_enabled = bool(
+                    await _maybe_await(st.commit_reveal_enabled(netuid=netuid))
+                )
+                last_details["commit_reveal_enabled"] = commit_reveal_enabled
+                result = await st.set_weights(
                     wallet=wallet,
                     netuid=netuid,
                     uids=uids,
                     weights=weights,
                     wait_for_inclusion=wfi,
                 )
+                success, message = _set_weights_result(result)
+                last_details.update(
+                    {"set_weights_success": success, "set_weights_message": message}
+                )
                 if not success:
                     await asyncio.sleep(delay_s)
                     continue
                 await st.wait_for_block()
+                if commit_reveal_enabled:
+                    commits = await _maybe_await(
+                        st.get_timelocked_weight_commits(netuid=netuid)
+                    )
+                    hotkey_commits = [
+                        commit for commit in commits or [] if commit[0] == wallet_hotkey
+                    ]
+                    newest_commit = max(
+                        hotkey_commits,
+                        key=lambda commit: int(commit[1]),
+                        default=None,
+                    )
+                    last_details.update(
+                        {
+                            "timelocked_commit_count": len(commits or []),
+                            "wallet_timelocked_commit_count": len(hotkey_commits),
+                        }
+                    )
+                    if newest_commit is not None:
+                        last_details.update(
+                            {
+                                "commit_block": int(newest_commit[1]),
+                                "reveal_round": int(newest_commit[3]),
+                            }
+                        )
+                        if int(newest_commit[1]) >= int(ref):
+                            return web.json_response(
+                                {
+                                    "success": True,
+                                    "details": {
+                                        **last_details,
+                                        "confirmation": "timelocked_commit",
+                                    },
+                                }
+                            )
+                    await asyncio.sleep(delay_s)
+                    continue
                 meta = await STATE.metagraph(netuid=netuid, lite=True)
                 try:
                     idx = meta.hotkeys.index(wallet_hotkey)
                 except ValueError:
+                    last_details.update(
+                        {
+                            "wallet_hotkey_found": False,
+                            "metagraph_block": int(getattr(meta, "block", 0) or 0),
+                        }
+                    )
                     await asyncio.sleep(delay_s)
                     continue
                 lu = int(meta.last_update[idx])
+                last_details.update(
+                    {
+                        "wallet_hotkey_found": True,
+                        "last_update": lu,
+                        "metagraph_block": int(getattr(meta, "block", 0) or 0),
+                    }
+                )
                 if lu >= int(ref):
                     return web.json_response(
                         {
@@ -308,11 +399,19 @@ async def run_subtensor_gateway() -> None:
                     type(e).__name__,
                     e,
                 )
+                last_details.update(
+                    {"exception_type": type(e).__name__, "exception": str(e)}
+                )
                 await STATE.reset_subtensor()
             await asyncio.sleep(delay_s)
 
         return web.json_response(
-            {"success": False, "error": "confirmation failed"}, status=500
+            {
+                "success": False,
+                "error": "confirmation failed",
+                "details": last_details,
+            },
+            status=500,
         )
 
     app = web.Application(middlewares=[access_log])

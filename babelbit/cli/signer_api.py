@@ -35,10 +35,33 @@ async def _set_weights_with_confirmation(
     delay_s: float = 2.0,
     log_prefix: str = "[signer]",
 ) -> bool:
+    result = await _set_weights_with_confirmation_response(
+        wallet=wallet,
+        netuid=netuid,
+        uids=uids,
+        weights=weights,
+        wait_for_inclusion=wait_for_inclusion,
+        retries=retries,
+        delay_s=delay_s,
+        log_prefix=log_prefix,
+    )
+    return bool(result.get("success", False))
+
+
+async def _set_weights_with_confirmation_response(
+    wallet: "bt.wallet",
+    netuid: int,
+    uids: list[int],
+    weights: list[float],
+    wait_for_inclusion: bool,
+    retries: int = 20,
+    delay_s: float = 2.0,
+    log_prefix: str = "[signer]",
+) -> dict:
     """Set weights via subtensor gateway and wait for confirmation."""
     gateway = SubtensorGatewayClient()
     try:
-        ok = await gateway.set_weights_and_confirm(
+        body = await gateway.set_weights_and_confirm_response(
             netuid=netuid,
             uids=uids,
             weights=weights,
@@ -47,11 +70,20 @@ async def _set_weights_with_confirmation(
             delay_s=delay_s,
             wallet_hotkey=wallet.hotkey.ss58_address,
         )
+        ok = bool(body.get("success", False))
         if ok:
-            logger.info("%s confirmation OK via gateway", log_prefix)
+            logger.info(
+                "%s confirmation OK via gateway details=%s",
+                log_prefix,
+                body.get("details"),
+            )
         else:
-            logger.warning("%s confirmation failed via gateway", log_prefix)
-        return ok
+            logger.warning(
+                "%s confirmation failed via gateway details=%s",
+                log_prefix,
+                body.get("details"),
+            )
+        return body
     except Exception as e:
         logger.warning(
             "%s gateway set_weights failed: %s: %s",
@@ -59,7 +91,11 @@ async def _set_weights_with_confirmation(
             type(e).__name__,
             e,
         )
-        return False
+        return {
+            "success": False,
+            "error": "gateway exception",
+            "details": {"exception_type": type(e).__name__, "exception": str(e)},
+        }
 
 
 async def run_signer() -> None:
@@ -143,7 +179,7 @@ async def run_signer() -> None:
                     status=400,
                 )
 
-            ok = await _set_weights_with_confirmation(
+            result = await _set_weights_with_confirmation_response(
                 wallet,
                 netuid,
                 uids,
@@ -153,11 +189,16 @@ async def run_signer() -> None:
                 delay_s=float(os.getenv("SIGNER_RETRY_DELAY", "2")),
                 log_prefix="[signer]",
             )
+            ok = bool(result.get("success", False))
             return web.json_response(
                 (
-                    {"success": True}
+                    {"success": True, "details": result.get("details")}
                     if ok
-                    else {"success": False, "error": "confirmation failed"}
+                    else {
+                        "success": False,
+                        "error": result.get("error", "confirmation failed"),
+                        "details": result.get("details"),
+                    }
                 ),
                 status=200 if ok else 500,
             )

@@ -300,6 +300,63 @@ async def test_gateway_runsync_retries_pod_recreating_error_before_success():
 
 
 @pytest.mark.asyncio
+async def test_gateway_runsync_does_not_retry_miner_app_unavailable():
+    _GATEWAY_AUTH_TOKEN_CACHE.clear()
+    session = _MockSession(
+        [
+            _MockResponse(200, '{"auth_token":"tok","expires_in":300}'),
+            _MockResponse(
+                503,
+                '{"error":{"code":"miner_app_unavailable","message":"Miner app unavailable","details":{"detail":"Miner not initialized"}}}',
+            ),
+        ]
+    )
+    keypair = Mock()
+    keypair.sign.return_value = b"sig"
+    settings = SimpleNamespace(
+        BB_ARENA_MINER_TIMEOUT_SEC=10,
+        BB_MINER_TIMEOUT_SEC=10,
+        BB_ARENA_GATEWAY_AUTH_API_PATH="/auth/token",
+        BB_ARENA_RUNSYNC_API_PATH="/runsync",
+    )
+    payload = BBAudioMinerInitPayload(
+        challenge_uid="c1",
+        utterance_id="u1",
+        sample_rate_hz=24000,
+        frame_rate_hz=12.5,
+        frame_samples=1920,
+        dtype="float32le",
+        channels=1,
+    )
+
+    with (
+        patch("babelbit.utils.predict_engine.get_settings", return_value=settings),
+        patch("babelbit.utils.predict_engine.get_async_client", new_callable=AsyncMock, return_value=session),
+        patch("babelbit.utils.predict_engine.asyncio.sleep", new_callable=AsyncMock) as sleep_mock,
+        patch(
+            "babelbit.utils.predict_engine._get_validator_identity",
+            return_value={
+                "keypair": keypair,
+                "hotkey": "validator-hk",
+                "external_ip": "127.0.0.1",
+                "uuid": "validator-uuid",
+            },
+        ),
+    ):
+        response = await call_gateway_runsync_audio_endpoint(
+            "http://gateway.test/runsync",
+            payload,
+            miner_hotkey="miner-hk",
+            miner_uid=8,
+            timeout=20,
+        )
+
+    assert "miner_app_unavailable" in response["error"]
+    assert len(session.posts) == 2
+    sleep_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_managed_container_pod_route_starts_and_waits_before_predict():
     session = _MockMixedSession(
         gets=[_MockResponse(200, '{"status":"ok"}')],

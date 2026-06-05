@@ -623,6 +623,38 @@ async def test_resolve_round2_routes_accepts_gateway_routes_from_arena_miners():
 
 
 @pytest.mark.asyncio
+async def test_resolve_round2_routes_prefers_live_duplicate_route_status():
+    miners = {
+        1: Miner(uid=1, hotkey="hk1", block=100, axon_ip="1.1.1.1", axon_port=8091),
+    }
+    containers = [
+        {
+            "miner_hotkey": "hk1",
+            "miner_uid": 1,
+            "provider": "gateway",
+            "endpoint_url": "https://gw.babelbit.ai/runsync",
+            "status": "unavailable",
+            "container_name": "ctr-old",
+        },
+        {
+            "miner_hotkey": "hk1",
+            "miner_uid": 1,
+            "provider": "gateway",
+            "endpoint_url": "https://gw.babelbit.ai/runsync",
+            "status": "running",
+            "container_name": "ctr-live",
+        },
+    ]
+
+    with patch("babelbit.utils.managed_container_registry.get_miners_from_registry", new_callable=AsyncMock, return_value=miners):
+        round2_miners, routes_by_hotkey = await resolve_round2_routes(netuid=42, containers=containers)
+
+    assert [m.hotkey for m in round2_miners] == ["hk1"]
+    assert routes_by_hotkey["hk1"].status == "running"
+    assert routes_by_hotkey["hk1"].container_name == "ctr-live"
+
+
+@pytest.mark.asyncio
 async def test_resolve_round2_routes_canonicalizes_hotkey_from_uid_match():
     miners = {
         1: Miner(uid=1, hotkey="hk1", block=100, axon_ip="1.1.1.1", axon_port=8091),

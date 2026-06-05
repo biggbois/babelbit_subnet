@@ -51,9 +51,18 @@ def _gateway_retry_delay_seconds(attempt: int) -> float:
 
 
 def _is_retryable_gateway_error(status: int, body: str) -> bool:
+    text = str(body or "").lower()
+    if any(
+        marker in text
+        for marker in (
+            "miner_app_unavailable",
+            "miner not initialized",
+            "not initialized",
+        )
+    ):
+        return False
     if status in {404, 429, 503, 504}:
         return True
-    text = str(body or "").lower()
     return any(
         marker in text
         for marker in (
@@ -462,6 +471,10 @@ async def call_managed_container_audio_endpoint(
                 getattr(settings, "BB_MINER_TIMEOUT_SEC", 10),
             )
         )
+    timeout = max(
+        float(timeout),
+        float(getattr(settings, "BB_S2S_INIT_TIMEOUT_SEC", 60.0)),
+    )
 
     url = endpoint_url.strip()
     if not url:
@@ -553,6 +566,11 @@ async def call_gateway_runsync_audio_endpoint(
                 getattr(settings, "BB_MINER_TIMEOUT_SEC", 10),
             )
         )
+    timeout = max(
+        float(timeout),
+        float(getattr(settings, "BB_S2S_INIT_TIMEOUT_SEC", 60.0)),
+        float(getattr(settings, "BB_ARENA_GATEWAY_TIMEOUT_SEC", 300.0)),
+    )
 
     url = _normalize_gateway_runsync_url(gateway_url)
     if not url:
@@ -649,11 +667,20 @@ async def call_gateway_runsync_audio_endpoint(
                     f"{request_attempt}:{uuid.uuid4().hex}"
                 ),
             }
+            post_timeout = max(1.0, min(float(timeout), deadline - monotonic()))
+            logger.info(
+                "Gateway audio runsync request begin url=%s miner_hk=%s miner_uid=%s timeout=%.2fs attempt=%s",
+                url,
+                (miner_hotkey[:16] + "...") if miner_hotkey else "?",
+                miner_uid,
+                post_timeout,
+                request_attempt,
+            )
             async with session.post(
                 url,
                 headers={"Content-Type": "application/json"},
                 json=request_body,
-                timeout=ClientTimeout(total=max(1.0, min(float(timeout), deadline - monotonic()))),
+                timeout=ClientTimeout(total=post_timeout),
             ) as response:
                 text = await response.text()
                 if response.status == 401 and auth_attempt == 0:

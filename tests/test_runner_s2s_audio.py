@@ -15,6 +15,7 @@ import pytest
 from babelbit.cli.runner import (
     _build_axon_audio_callbacks,
     _build_round2_audio_callbacks,
+    _resolve_round2_routes_when_ready,
     runner,
     runner_round2,
 )
@@ -22,12 +23,18 @@ from babelbit.scoring.reference_metadata import resolve_audio_reference_metadata
 from babelbit.scoring.utterance_scoring import score_audio_utterance_batch
 from babelbit.schemas.audio_prediction import (
     BBAudioChallengeResult,
+    BBAudioUEUtterance,
     BBAudioUtteranceResult,
 )
 from babelbit.utils.miner_registry import Miner
 from babelbit.utils.managed_container_registry import ManagedRoute
 from babelbit.utils.predict_audio import (
     AudioChallengeError,
+    _DecodedWav,
+    _MinerAudio,
+    _MinerUtteranceSession,
+    _start_utterances_with_keepalive,
+    _drain_miner_until_eos,
     predict_source_audio_multi_miner,
 )
 
@@ -61,7 +68,7 @@ async def test_audio_callbacks_use_separate_init_timeout():
         return {"ok": True}
 
     async def fake_call_managed_route_audio_endpoint(**kwargs):
-        calls.append(("round2", kwargs["timeout"]))
+        calls.append(("round2", kwargs["timeout"], kwargs["route"].miner_uid))
         return {"ok": True}
 
     miner = Miner(uid=8, hotkey="hk", block=1, axon_ip="127.0.0.1", axon_port=8000)
@@ -84,17 +91,120 @@ async def test_audio_callbacks_use_separate_init_timeout():
             init_timeout=60.0,
         )
 
-        await axon_init(miner, SimpleNamespace())
+        await axon_init(miner, SimpleNamespace(utterance_id="challenge-audio:0"))
         await axon_predict(miner, SimpleNamespace())
-        await round2_init(miner, SimpleNamespace())
+        await round2_init(miner, SimpleNamespace(utterance_id="challenge-audio:0"))
         await round2_predict(miner, SimpleNamespace())
 
     assert calls == [
         ("axon", 60.0),
         ("axon", 10.0),
-        ("round2", 60.0),
-        ("round2", 10.0),
+        ("round2", 60.0, 8),
+        ("round2", 10.0, 8),
     ]
+
+
+@pytest.mark.asyncio
+async def test_audio_callbacks_use_default_timeout_after_first_utterance():
+    calls = []
+
+    async def fake_call_miner_axon_audio_endpoint(**kwargs):
+        calls.append(("axon", kwargs["timeout"], kwargs["payload"].utterance_id))
+        return {"ok": True}
+
+    async def fake_call_managed_route_audio_endpoint(**kwargs):
+        calls.append(
+            (
+                "round2",
+                kwargs["timeout"],
+                kwargs["payload"].utterance_id,
+                kwargs["route"].miner_uid,
+            )
+        )
+        return {"ok": True}
+
+    miner = Miner(uid=8, hotkey="hk", block=1, axon_ip="127.0.0.1", axon_port=8000)
+    route = ManagedRoute(miner_hotkey="hk", endpoint_url="http://miner")
+
+    with patch(
+        "babelbit.utils.predict_engine.call_miner_axon_audio_endpoint",
+        side_effect=fake_call_miner_axon_audio_endpoint,
+    ), patch(
+        "babelbit.utils.predict_engine.call_managed_route_audio_endpoint",
+        side_effect=fake_call_managed_route_audio_endpoint,
+    ):
+        axon_init, _ = _build_axon_audio_callbacks(
+            miner_timeout=10.0,
+            init_timeout=60.0,
+        )
+        round2_init, _ = _build_round2_audio_callbacks(
+            routes_by_hotkey={"hk": route},
+            miner_timeout=10.0,
+            init_timeout=60.0,
+        )
+
+        await axon_init(miner, SimpleNamespace(utterance_id="challenge-audio:1"))
+        await round2_init(miner, SimpleNamespace(utterance_id="challenge-audio:1"))
+
+    assert calls == [
+        ("axon", 10.0, "challenge-audio:1"),
+        ("round2", 10.0, "challenge-audio:1", 8),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_start_utterances_with_keepalive_caps_pending_init_miners():
+    miners = [
+        Miner(uid=8, hotkey="hk-ready", block=1),
+        Miner(uid=9, hotkey="hk-stuck", block=1),
+    ]
+    ue_utterance = SimpleNamespace(
+        challenge_uid="challenge-audio",
+        utterance_id="challenge-audio:0",
+        language="fr",
+    )
+    decoded_audio = _DecodedWav(
+        sample_rate_hz=24_000,
+        channels=1,
+        sample_width_bytes=2,
+        frame_count=1,
+        pcm_bytes=b"\x00\x00",
+    )
+
+    async def init_callback(miner, payload):
+        if miner.hotkey == "hk-stuck":
+            await asyncio.sleep(3600)
+        return {
+            "ready": True,
+            "miner_id": "toy",
+            "session_id": f"session-{miner.hotkey}",
+            "challenge_uid": payload.challenge_uid,
+            "utterance_id": payload.utterance_id,
+            "language": payload.language,
+            "sample_rate_hz": payload.sample_rate_hz,
+            "frame_rate_hz": payload.frame_rate_hz,
+            "frame_samples": payload.frame_samples,
+            "dtype": payload.dtype,
+            "channels": payload.channels,
+        }
+
+    results = await asyncio.wait_for(
+        _start_utterances_with_keepalive(
+            miners=miners,
+            ue_utterance=ue_utterance,
+            decoded_audio=decoded_audio,
+            source_audio_bytes=b"RIFF",
+            init_callback=init_callback,
+            keepalive_enabled=False,
+            keepalive_interval_seconds=30.0,
+            init_barrier_timeout_seconds=0.01,
+        ),
+        timeout=1.0,
+    )
+
+    assert isinstance(results[0], _MinerUtteranceSession)
+    assert isinstance(results[1], AudioChallengeError)
+    assert "Arena init barrier exceeded" in str(results[1])
 
 
 def test_resolve_audio_reference_metadata_supports_translation_schema(tmp_path):
@@ -1124,6 +1234,7 @@ async def test_predict_source_audio_multi_miner_allows_slow_final_eos_frame():
                 BB_S2S_DRAIN_MAX_REQUESTS=8,
                 BB_S2S_CHUNK_TIMEOUT_SEC=0.01,
                 BB_S2S_DRAIN_TIMEOUT_SEC=0.05,
+                BB_S2S_FINAL_DRAIN_MIN_TIMEOUT_SEC=0.05,
             ),
         ),
     ):
@@ -1222,6 +1333,7 @@ async def test_predict_source_audio_multi_miner_fails_when_drain_timeout_exhaust
                 BB_S2S_DRAIN_MAX_REQUESTS=8,
                 BB_S2S_CHUNK_TIMEOUT_SEC=0.05,
                 BB_S2S_DRAIN_TIMEOUT_SEC=0.02,
+                BB_S2S_FINAL_DRAIN_MIN_TIMEOUT_SEC=0.0,
             ),
         ),
     ):
@@ -1242,6 +1354,68 @@ async def test_predict_source_audio_multi_miner_fails_when_drain_timeout_exhaust
     assert "drain response after final audio chunk" in (
         results["hk1"].utterances[0].error or ""
     )
+
+
+@pytest.mark.asyncio
+async def test_drain_miner_uses_minimum_timeout_after_global_budget_expires():
+    miner = Miner(uid=8, hotkey="hk1", block=1)
+    session = _MinerUtteranceSession(
+        miner=miner,
+        ue_utterance=BBAudioUEUtterance(
+            challenge_uid="challenge-audio",
+            session_id="ue-session",
+            utterance_index=0,
+            utterance_id="challenge-audio:0",
+            language="fr",
+            sample_rate_hz=8,
+            channels=1,
+            sample_width_bytes=2,
+            utterance_frames=8,
+            audio_b64="",
+        ),
+        decoded_audio=_DecodedWav(
+            sample_rate_hz=8,
+            channels=1,
+            sample_width_bytes=2,
+            frame_count=8,
+            pcm_bytes=b"",
+        ),
+        miner_audio=_MinerAudio(
+            sample_rate_hz=8,
+            channels=1,
+            sample_width_bytes=2,
+            dtype="pcm_s16le",
+            frame_count=8,
+            pcm_bytes=b"",
+        ),
+        source_audio_bytes=b"",
+        started_at=0.0,
+        session_id="miner-session",
+        frame_rate_hz=2.0,
+        frame_samples=4,
+        input_frames=[b"abcd"],
+        output_chunks=[],
+        last_input_chunk_sent_at=0.0,
+    )
+
+    async def predict_callback(_miner, payload):
+        await asyncio.sleep(0.02)
+        return {
+            "session_id": payload.session_id,
+            "audio_b64": "",
+            "out_eos": True,
+            "n_bytes": 0,
+        }
+
+    await _drain_miner_until_eos(
+        session,
+        max_requests=1,
+        global_timeout_seconds=0.001,
+        min_timeout_seconds=0.05,
+        predict_callback=predict_callback,
+    )
+
+    assert session.saw_out_eos is True
 
 
 @pytest.mark.asyncio
@@ -1338,6 +1512,211 @@ async def test_predict_source_audio_multi_miner_processes_final_done_utterance()
     assert len(challenge_result.utterances) == 2
     assert challenge_result.utterances[0].utterance_id == "challenge-audio:0"
     assert challenge_result.utterances[1].utterance_id == "challenge-audio:1"
+
+
+@pytest.mark.asyncio
+async def test_predict_source_audio_multi_miner_arena_drops_first_utterance_failures():
+    wav_first = _build_test_wav(sample_rate_hz=24_000, frame_count=1_920)
+    wav_second = _build_test_wav(sample_rate_hz=24_000, frame_count=1_920)
+    start_payload = {
+        "session_id": "ue-session",
+        "challenge_uid": "challenge-audio",
+        "utterance_index": 0,
+        "utterance_id": "challenge-audio:0",
+        "language": "fr",
+        "sample_rate_hz": 24_000,
+        "channels": 1,
+        "sample_width_bytes": 2,
+        "utterance_frames": 1_920,
+        "end_of_utterance": True,
+        "done": False,
+        "audio_b64": base64.b64encode(wav_first).decode("ascii"),
+    }
+    final_payload = {
+        "session_id": "ue-session",
+        "challenge_uid": "challenge-audio",
+        "utterance_index": 1,
+        "utterance_id": "challenge-audio:1",
+        "language": "fr",
+        "sample_rate_hz": 24_000,
+        "channels": 1,
+        "sample_width_bytes": 2,
+        "utterance_frames": 1_920,
+        "end_of_utterance": True,
+        "done": True,
+        "audio_b64": base64.b64encode(wav_second).decode("ascii"),
+    }
+    good_miner = Miner(uid=185, hotkey="hk-good", block=1)
+    bad_miner = Miner(uid=113, hotkey="hk-bad", block=1)
+    init_calls = []
+    session_buffers = {}
+
+    async def init_callback(miner, payload):
+        init_calls.append((miner.hotkey, payload.utterance_id))
+        if miner.hotkey == "hk-bad":
+            raise AudioChallengeError("cold pod")
+        return {
+            "ready": True,
+            "miner_id": miner.hotkey,
+            "session_id": f"{miner.hotkey}:{payload.utterance_id}",
+            "challenge_uid": payload.challenge_uid,
+            "utterance_id": payload.utterance_id,
+            "sample_rate_hz": payload.sample_rate_hz,
+            "frame_rate_hz": payload.frame_rate_hz,
+            "frame_samples": payload.frame_samples,
+            "dtype": payload.dtype,
+            "channels": payload.channels,
+        }
+
+    async def predict_callback(_miner, payload):
+        decoded = base64.b64decode(payload.audio_b64)
+        session_buffers.setdefault(payload.session_id, []).append(decoded)
+        pcm = b"".join(session_buffers[payload.session_id])
+        return {
+            "session_id": payload.session_id,
+            "audio_b64": base64.b64encode(pcm).decode("ascii"),
+            "out_eos": payload.in_eos,
+            "n_bytes": len(pcm),
+        }
+
+    def fake_score_audio_utterance_batch(**kwargs):
+        return [
+            {
+                "score": 1.0,
+                "accuracy": 1.0,
+                "speech_rate": {},
+                "latency": {"score": 1.0},
+                "stt_text": "",
+                "gt_text": "",
+                "predicted_duration_sec": 0.0,
+                "effective_completion_sec": 0.0,
+                "source_duration_sec": 0.0,
+                "score_is_fallback": False,
+                "score_method": "semantic_audio_v1",
+            }
+            for _ in kwargs["predictions"]
+        ]
+
+    with (
+        patch(
+            "babelbit.utils.predict_audio.start_source_audio_session",
+            AsyncMock(return_value=start_payload),
+        ),
+        patch(
+            "babelbit.utils.predict_audio.next_source_audio_utterance",
+            AsyncMock(return_value=final_payload),
+        ),
+        patch(
+            "babelbit.utils.predict_audio.fetch_transcription_ground_truth",
+            AsyncMock(side_effect=AudioChallengeError("no transcription")),
+        ),
+        patch(
+            "babelbit.utils.predict_audio.score_audio_utterance_batch",
+            side_effect=fake_score_audio_utterance_batch,
+        ),
+    ):
+        _challenge_uid, results = await predict_source_audio_multi_miner(
+            utterance_engine_url="http://ue.test",
+            miners=[good_miner, bad_miner],
+            init_callback=init_callback,
+            predict_callback=predict_callback,
+            challenge_type="arena",
+        )
+
+    assert init_calls == [
+        ("hk-good", "challenge-audio:0"),
+        ("hk-bad", "challenge-audio:0"),
+        ("hk-good", "challenge-audio:1"),
+    ]
+    assert len(results["hk-good"].utterances) == 2
+    assert results["hk-good"].completed is True
+    assert len(results["hk-bad"].utterances) == 1
+    assert results["hk-bad"].completed is False
+    assert results["hk-bad"].utterances[0].completed is False
+
+
+@pytest.mark.asyncio
+async def test_predict_source_audio_multi_miner_prefetches_before_miner_init():
+    wav_first = _build_test_wav(frame_count=8)
+    wav_final = _build_test_wav(frame_count=8)
+    start_payload = {
+        "session_id": "ue-session",
+        "challenge_uid": "challenge-audio",
+        "utterance_index": 0,
+        "utterance_id": "challenge-audio:0",
+        "language": "fr",
+        "sample_rate_hz": 8,
+        "channels": 1,
+        "sample_width_bytes": 2,
+        "utterance_frames": 8,
+        "end_of_utterance": True,
+        "done": False,
+        "audio_b64": base64.b64encode(wav_first).decode("ascii"),
+    }
+    final_payload = {
+        "session_id": "ue-session",
+        "challenge_uid": "challenge-audio",
+        "utterance_index": 1,
+        "utterance_id": "challenge-audio:1",
+        "language": "fr",
+        "sample_rate_hz": 8,
+        "channels": 1,
+        "sample_width_bytes": 2,
+        "utterance_frames": 8,
+        "end_of_utterance": True,
+        "done": True,
+        "audio_b64": base64.b64encode(wav_final).decode("ascii"),
+    }
+    events: list[str] = []
+    miner = Miner(uid=8, hotkey="hk1", block=1)
+
+    async def init_callback(_miner, payload):
+        events.append(f"init:{payload.utterance_id}")
+        return {
+            "ready": True,
+            "miner_id": "toy",
+            "session_id": f"miner-session-{payload.utterance_id}",
+            "challenge_uid": payload.challenge_uid,
+            "utterance_id": payload.utterance_id,
+            "sample_rate_hz": payload.sample_rate_hz,
+            "frame_rate_hz": 2.0,
+            "frame_samples": 4,
+            "dtype": payload.dtype,
+            "channels": payload.channels,
+        }
+
+    async def predict_callback(_miner, payload):
+        return {
+            "session_id": payload.session_id,
+            "audio_b64": payload.audio_b64,
+            "out_eos": payload.in_eos,
+            "n_bytes": len(base64.b64decode(payload.audio_b64)) if payload.audio_b64 else 0,
+        }
+
+    async def next_callback(_url, _session_id):
+        events.append("next")
+        return final_payload
+
+    with (
+        patch(
+            "babelbit.utils.predict_audio.start_source_audio_session",
+            AsyncMock(return_value=start_payload),
+        ),
+        patch(
+            "babelbit.utils.predict_audio.next_source_audio_utterance",
+            AsyncMock(side_effect=next_callback),
+        ),
+    ):
+        _challenge_uid, results = await predict_source_audio_multi_miner(
+            utterance_engine_url="http://ue.test",
+            miners=[miner],
+            init_callback=init_callback,
+            predict_callback=predict_callback,
+            challenge_type="main",
+        )
+
+    assert events[:2] == ["next", "init:challenge-audio:0"]
+    assert len(results["hk1"].utterances) == 2
 
 
 @pytest.mark.asyncio
@@ -2434,7 +2813,7 @@ async def test_runner_round2_does_not_mark_processed_for_partial_challenge(tmp_p
     logs_dir = tmp_path / "logs"
     scores_dir = tmp_path / "scores"
     miner = Miner(uid=8, hotkey="hk1", block=1)
-    route = ManagedRoute(miner_hotkey="hk1", endpoint_url="http://miner")
+    route = ManagedRoute(miner_hotkey="hk1", endpoint_url="http://miner", status="running")
     source_wav = _build_test_wav(frame_count=6)
     predicted_wav = _build_test_wav(frame_count=6)
     challenge_result = BBAudioChallengeResult(
@@ -2551,6 +2930,120 @@ async def test_runner_round2_does_not_mark_processed_for_partial_challenge(tmp_p
         "AudioChallengeError:Failed to advance source-audio session: HTTP 503"
     )
     mock_mark_processed.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_round2_routes_when_ready_waits_for_all_discovered_routes():
+    miners = [
+        Miner(uid=1, hotkey="hk1", block=1),
+        Miner(uid=2, hotkey="hk2", block=1),
+    ]
+    warming_routes = {
+        "hk1": ManagedRoute(miner_hotkey="hk1", endpoint_url="http://miner-1", status="running"),
+        "hk2": ManagedRoute(miner_hotkey="hk2", endpoint_url="http://miner-2", status="warming"),
+    }
+    ready_routes = {
+        "hk1": ManagedRoute(miner_hotkey="hk1", endpoint_url="http://miner-1", status="running"),
+        "hk2": ManagedRoute(miner_hotkey="hk2", endpoint_url="http://miner-2", status="idle"),
+    }
+
+    with (
+        patch(
+            "babelbit.cli.runner.resolve_round2_routes",
+            AsyncMock(side_effect=[(miners, warming_routes), (miners, ready_routes)]),
+        ) as mock_resolve,
+        patch("babelbit.cli.runner.asyncio.sleep", AsyncMock()) as mock_sleep,
+    ):
+        resolved_miners, routes_by_hotkey = await _resolve_round2_routes_when_ready(
+            netuid=42,
+            subtensor=None,
+            ready_timeout_sec=30,
+            poll_sec=5,
+        )
+
+    assert resolved_miners == miners
+    assert routes_by_hotkey == ready_routes
+    assert mock_resolve.await_count == 2
+    mock_sleep.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resolve_round2_routes_when_ready_timeout_keeps_live_routes_only():
+    miners = [
+        Miner(uid=1, hotkey="hk1", block=1),
+        Miner(uid=2, hotkey="hk2", block=1),
+        Miner(uid=3, hotkey="hk3", block=1),
+    ]
+    routes = {
+        "hk1": ManagedRoute(miner_hotkey="hk1", endpoint_url="http://miner-1", status="running"),
+        "hk2": ManagedRoute(miner_hotkey="hk2", endpoint_url="http://miner-2", status="warming"),
+        "hk3": ManagedRoute(miner_hotkey="hk3", endpoint_url="http://miner-3", status="unavailable"),
+    }
+
+    with patch(
+        "babelbit.cli.runner.resolve_round2_routes",
+        AsyncMock(return_value=(miners, routes)),
+    ) as mock_resolve:
+        resolved_miners, routes_by_hotkey = await _resolve_round2_routes_when_ready(
+            netuid=42,
+            subtensor=None,
+            ready_timeout_sec=0,
+            poll_sec=5,
+        )
+
+    assert [miner.hotkey for miner in resolved_miners] == ["hk1"]
+    assert set(routes_by_hotkey) == {"hk1"}
+    assert mock_resolve.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_round2_routes_when_ready_waits_for_gateway_warming_routes():
+    miners = [
+        Miner(uid=1, hotkey="hk1", block=1),
+        Miner(uid=2, hotkey="hk2", block=1),
+    ]
+    warming_routes = {
+        "hk1": ManagedRoute(
+            miner_hotkey="hk1",
+            endpoint_url="https://gw.example/runsync",
+            provider="gateway",
+            status="warming",
+        ),
+        "hk2": ManagedRoute(
+            miner_hotkey="hk2",
+            endpoint_url="https://gw.example/runsync",
+            provider="gateway",
+            status="idle",
+        ),
+    }
+    ready_routes = {
+        "hk1": ManagedRoute(
+            miner_hotkey="hk1",
+            endpoint_url="https://gw.example/runsync",
+            provider="gateway",
+            status="running",
+        ),
+        "hk2": warming_routes["hk2"],
+    }
+
+    with (
+        patch(
+            "babelbit.cli.runner.resolve_round2_routes",
+            AsyncMock(side_effect=[(miners, warming_routes), (miners, ready_routes)]),
+        ) as mock_resolve,
+        patch("babelbit.cli.runner.asyncio.sleep", AsyncMock()) as mock_sleep,
+    ):
+        resolved_miners, routes_by_hotkey = await _resolve_round2_routes_when_ready(
+            netuid=42,
+            subtensor=None,
+            ready_timeout_sec=30,
+            poll_sec=5,
+        )
+
+    assert resolved_miners == miners
+    assert routes_by_hotkey == ready_routes
+    assert mock_resolve.await_count == 2
+    mock_sleep.assert_awaited_once()
 
 
 def test_score_audio_utterance_batch_uses_speech_rate_penalty_key(tmp_path):
