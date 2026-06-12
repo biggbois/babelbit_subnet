@@ -765,6 +765,14 @@ async def _start_utterances_with_keepalive(
 
     while tasks:
         wait_timeout = interval if keepalive_enabled and ready_sessions else None
+        if ready_sessions:
+            ready_grace_remaining = interval - (perf_counter() - started_at)
+            if ready_grace_remaining <= 0.0:
+                wait_timeout = 0.0
+            elif wait_timeout is None:
+                wait_timeout = ready_grace_remaining
+            else:
+                wait_timeout = min(wait_timeout, ready_grace_remaining)
         if barrier_timeout > 0.0:
             remaining_barrier = barrier_timeout - (perf_counter() - started_at)
             if remaining_barrier <= 0.0:
@@ -809,38 +817,47 @@ async def _start_utterances_with_keepalive(
             if isinstance(result, _MinerUtteranceSession):
                 ready_sessions[hotkey] = result
 
+        if pending and ready_sessions:
+            ready_grace_remaining = interval - (perf_counter() - started_at)
+            if ready_grace_remaining <= 0.0:
+                logger.info(
+                    "S2S audio init ready-miner grace reached: challenge=%s utterance=%s ready_miners=%d pending_miners=%d grace_s=%.2f",
+                    ue_utterance.challenge_uid,
+                    ue_utterance.utterance_id,
+                    len(ready_sessions),
+                    len(pending),
+                    interval,
+                )
+                grace_exc = AudioChallengeError(
+                    f"Arena ready-miner grace exceeded after {interval:.2f}s"
+                )
+                pending_items = list(tasks.items())
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks.keys(), return_exceptions=True)
+                for task, miner in pending_items:
+                    tasks.pop(task, None)
+                    hotkey = str(getattr(miner, "hotkey", ""))
+                    if hotkey in ready_sessions:
+                        continue
+                    results_by_hotkey[hotkey] = grace_exc
+                break
+
         if not pending or not keepalive_enabled or not ready_sessions:
             continue
         now = perf_counter()
         if now - last_keepalive_at < interval:
             continue
         last_keepalive_at = now
-        keepalive_tasks = []
         for session in ready_sessions.values():
-            init_payload = _build_miner_init_payload(
-                ue_utterance=session.ue_utterance,
-                miner_audio=session.miner_audio,
+            logger.info(
+                "S2S audio init keepalive skipped for ready session while waiting for cold miners: challenge=%s utterance=%s %s session=%s pending_miners=%d",
+                session.ue_utterance.challenge_uid,
+                session.ue_utterance.utterance_id,
+                _miner_log_label(session.miner),
+                session.session_id,
+                len(pending),
             )
-            keepalive_tasks.append(init_callback(session.miner, init_payload))
-        keepalive_results = await asyncio.gather(*keepalive_tasks, return_exceptions=True)
-        for session, keepalive_result in zip(ready_sessions.values(), keepalive_results):
-            if isinstance(keepalive_result, BaseException):
-                logger.info(
-                    "S2S audio init keepalive failed while waiting for cold miners: challenge=%s utterance=%s %s error=%s:%s",
-                    session.ue_utterance.challenge_uid,
-                    session.ue_utterance.utterance_id,
-                    _miner_log_label(session.miner),
-                    type(keepalive_result).__name__,
-                    keepalive_result,
-                )
-            else:
-                logger.info(
-                    "S2S audio init keepalive sent while waiting for cold miners: challenge=%s utterance=%s %s pending_miners=%d",
-                    session.ue_utterance.challenge_uid,
-                    session.ue_utterance.utterance_id,
-                    _miner_log_label(session.miner),
-                    len(pending),
-                )
 
     return [results_by_hotkey.get(str(getattr(miner, "hotkey", ""))) for miner in miners]
 
@@ -850,6 +867,8 @@ async def _predict_frame_for_miner(
     *,
     frame_index: int,
     response_timeout_seconds: float,
+    startup_response_timeout_seconds: float | None = None,
+    startup_frame_count: int = 0,
     final_response_timeout_seconds: float | None = None,
     predict_callback: Callable[
         [Any, BBAudioMinerPredictPayload], Awaitable[Dict[str, Any]]
@@ -876,6 +895,12 @@ async def _predict_frame_for_miner(
     if in_eos:
         session.last_input_chunk_sent_at = perf_counter()
     timeout_seconds = response_timeout_seconds
+    if (
+        startup_response_timeout_seconds is not None
+        and startup_frame_count > 0
+        and frame_index < startup_frame_count
+    ):
+        timeout_seconds = max(timeout_seconds, startup_response_timeout_seconds)
     if in_eos and final_response_timeout_seconds is not None:
         timeout_seconds = final_response_timeout_seconds
     predict_response_data = await _await_predict_response(
@@ -1254,10 +1279,41 @@ async def predict_source_audio_multi_miner(
     total_miner_serving_seconds = 0.0
     total_scoring_seconds = 0.0
     active_miners = list(miners)
+    arena_consecutive_failures = {
+        str(getattr(miner, "hotkey", "")): 0 for miner in active_miners
+    }
     settings = get_settings()
     max_drain_requests = max(0, int(getattr(settings, "BB_S2S_DRAIN_MAX_REQUESTS", 8)))
     chunk_response_timeout_seconds = max(
         0.001, float(getattr(settings, "BB_S2S_CHUNK_TIMEOUT_SEC", 3.0))
+    )
+    arena_startup_chunk_timeout_seconds = max(
+        chunk_response_timeout_seconds,
+        float(
+            getattr(
+                settings,
+                "BB_ARENA_STARTUP_CHUNK_TIMEOUT_SEC",
+                60.0,
+            )
+        ),
+    )
+    arena_startup_chunk_count = max(
+        0,
+        int(getattr(settings, "BB_ARENA_STARTUP_CHUNK_COUNT", 4)),
+    )
+    arena_startup_utterance_count = max(
+        1,
+        int(getattr(settings, "BB_ARENA_STARTUP_UTTERANCE_COUNT", 3)),
+    )
+    arena_max_consecutive_failures = max(
+        1,
+        int(
+            getattr(
+                settings,
+                "BB_ARENA_MAX_CONSECUTIVE_UTTERANCE_FAILURES",
+                2,
+            )
+        ),
     )
     drain_timeout_seconds = max(
         0.001, float(getattr(settings, "BB_S2S_DRAIN_TIMEOUT_SEC", 10.0))
@@ -1369,6 +1425,22 @@ async def predict_source_audio_multi_miner(
                         session,
                         frame_index=frame_index,
                         response_timeout_seconds=chunk_response_timeout_seconds,
+                        startup_response_timeout_seconds=(
+                            arena_startup_chunk_timeout_seconds
+                            if (
+                                challenge_type == "arena"
+                                and utterance_position < arena_startup_utterance_count
+                            )
+                            else None
+                        ),
+                        startup_frame_count=(
+                            arena_startup_chunk_count
+                            if (
+                                challenge_type == "arena"
+                                and utterance_position < arena_startup_utterance_count
+                            )
+                            else 0
+                        ),
                         final_response_timeout_seconds=drain_timeout_seconds,
                         predict_callback=predict_callback,
                     )
@@ -1605,28 +1677,49 @@ async def predict_source_audio_multi_miner(
             successful_miners,
             len(utterance_results) - successful_miners,
         )
-        if challenge_type == "arena" and utterance_position == 0:
+        if challenge_type == "arena":
             successful_hotkeys = {
                 result.miner_hotkey for result in utterance_results if result.completed
             }
+            for miner in active_miners:
+                hotkey = str(getattr(miner, "hotkey", ""))
+                if hotkey in successful_hotkeys:
+                    arena_consecutive_failures[hotkey] = 0
+                else:
+                    arena_consecutive_failures[hotkey] = (
+                        arena_consecutive_failures.get(hotkey, 0) + 1
+                    )
             dropped_miners = [
                 miner
                 for miner in active_miners
-                if str(getattr(miner, "hotkey", "")) not in successful_hotkeys
+                if arena_consecutive_failures.get(str(getattr(miner, "hotkey", "")), 0)
+                >= arena_max_consecutive_failures
             ]
             if dropped_miners:
                 logger.info(
-                    "S2S audio arena dropped miners after first utterance failure: challenge=%s utterance=%s dropped=%d kept=%d dropped_uids=%s",
+                    (
+                        "S2S audio arena dropped miners after repeated first utterance "
+                        "failures: challenge=%s utterance=%s dropped=%d kept=%d "
+                        "threshold=%d dropped_uids=%s"
+                        if utterance_position == 0
+                        else "S2S audio arena dropped miners after repeated utterance "
+                        "failures: challenge=%s utterance=%s dropped=%d kept=%d "
+                        "threshold=%d dropped_uids=%s"
+                    ),
                     current_utterance.challenge_uid,
                     current_utterance.utterance_id,
                     len(dropped_miners),
-                    len(successful_hotkeys),
+                    len(active_miners) - len(dropped_miners),
+                    arena_max_consecutive_failures,
                     ",".join(str(getattr(miner, "uid", -1)) for miner in dropped_miners),
                 )
                 active_miners = [
                     miner
                     for miner in active_miners
-                    if str(getattr(miner, "hotkey", "")) in successful_hotkeys
+                    if arena_consecutive_failures.get(
+                        str(getattr(miner, "hotkey", "")), 0
+                    )
+                    < arena_max_consecutive_failures
                 ]
 
         if current_utterance.done:

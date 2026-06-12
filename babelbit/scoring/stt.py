@@ -66,6 +66,7 @@ def _load_stt_cache(cache_path: Path) -> Dict[str, Dict[str, Any]]:
             cache[wav_hash] = {
                 "text": str(row.get("text", "")),
                 "words": normalize_words(row.get("words")),
+                "detected_language": str(row.get("detected_language", "")),
             }
 
     _STT_CACHE[cache_key] = cache
@@ -149,16 +150,25 @@ def _stt_faster_whisper(
     compute_type: str,
     device: str,
     language: str,
-) -> Tuple[str, List[WordTS]]:
+) -> Tuple[str, List[WordTS], str]:
+    """Transcribe audio, returning (text, words, detected_language).
+
+    Note: we deliberately pass language=None to allow Whisper to detect the
+    language from the audio.  The `language` parameter is retained for API
+    compatibility but ignored — checking the detected language against the
+    expected target is part of the scoring gate.
+    """
     model = _get_fw_model(model_id, compute_type, device)
 
     transcribe_input: Union[str, np.ndarray] = (
         audio_input if isinstance(audio_input, np.ndarray) else str(audio_input)
     )
 
-    segments, _info = model.transcribe(
-        transcribe_input, language=language, word_timestamps=True
+    segments, info = model.transcribe(
+        transcribe_input, language=None, word_timestamps=True
     )
+
+    detected_language = str(getattr(info, "language", "") or "")
 
     words: List[WordTS] = []
     text_parts: List[str] = []
@@ -174,7 +184,11 @@ def _stt_faster_whisper(
                     "end": float(word.end),
                 }
             )
-    return " ".join(part for part in text_parts if part).strip(), words
+    return (
+        " ".join(part for part in text_parts if part).strip(),
+        words,
+        detected_language,
+    )
 
 
 def transcribe_wav(
@@ -183,7 +197,7 @@ def transcribe_wav(
     stt_model: str,
     language: str,
     device: str,
-) -> Tuple[str, List[WordTS]]:
+) -> Tuple[str, List[WordTS], str]:
     validate_stt_model(stt_model)
     backend, model_id, compute_type = STT_MODEL_TABLE[stt_model]
     if backend == "faster-whisper":
@@ -205,7 +219,7 @@ def transcribe_wav_bytes(
     language: str,
     device: str,
     stt_cache_path: Path,
-) -> Tuple[str, List[WordTS]]:
+) -> Tuple[str, List[WordTS], str]:
     cache = _load_stt_cache(stt_cache_path)
     if wav_hash in cache:
         cached = cache[wav_hash]
@@ -215,13 +229,18 @@ def transcribe_wav_bytes(
             stt_model,
             device,
         )
-        return str(cached.get("text", "")), normalize_words(cached.get("words"))
+        return (
+            str(cached.get("text", "")),
+            normalize_words(cached.get("words")),
+            str(cached.get("detected_language", "")),
+        )
 
     validate_stt_model(stt_model)
     backend, model_id, compute_type = STT_MODEL_TABLE[stt_model]
 
     transcribe_started_at = perf_counter()
     audio_duration_sec = None
+    detected_language = ""
     if backend == "faster-whisper":
         decode_started_at = perf_counter()
         audio_array = _wav_bytes_to_whisper_input(wav_bytes)
@@ -230,7 +249,7 @@ def transcribe_wav_bytes(
             _WHISPER_SAMPLE_RATE_HZ
         )
         stt_started_at = perf_counter()
-        transcript_text, transcript_words = _stt_faster_whisper(
+        transcript_text, transcript_words, detected_language = _stt_faster_whisper(
             audio_array,
             model_id=model_id,
             compute_type=compute_type,
@@ -240,7 +259,7 @@ def transcribe_wav_bytes(
         stt_sec = perf_counter() - stt_started_at
         logger.info(
             "STT item profile: wav_hash=%s model=%s backend=%s device=%s "
-            "audio_sec=%.3f decode_sec=%.3f stt_sec=%.3f text_chars=%d words=%d",
+            "audio_sec=%.3f decode_sec=%.3f stt_sec=%.3f text_chars=%d words=%d detected_lang=%s",
             wav_hash,
             stt_model,
             backend,
@@ -250,6 +269,7 @@ def transcribe_wav_bytes(
             stt_sec,
             len(transcript_text),
             len(transcript_words),
+            detected_language,
         )
     elif backend == "openai":
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
@@ -265,10 +285,19 @@ def transcribe_wav_bytes(
     else:
         raise ValueError(f"Unknown STT backend: {backend}")
 
-    cache[wav_hash] = {"text": transcript_text, "words": transcript_words}
+    cache[wav_hash] = {
+        "text": transcript_text,
+        "words": transcript_words,
+        "detected_language": detected_language,
+    }
     _append_stt_cache(
         stt_cache_path,
-        {"wav_sha256": wav_hash, "text": transcript_text, "words": transcript_words},
+        {
+            "wav_sha256": wav_hash,
+            "text": transcript_text,
+            "words": transcript_words,
+            "detected_language": detected_language,
+        },
     )
     logger.info(
         "STT item complete: wav_hash=%s model=%s device=%s audio_sec=%s total_sec=%.3f",
@@ -278,7 +307,7 @@ def transcribe_wav_bytes(
         f"{audio_duration_sec:.3f}" if audio_duration_sec is not None else "unknown",
         perf_counter() - transcribe_started_at,
     )
-    return transcript_text, transcript_words
+    return transcript_text, transcript_words, detected_language
 
 
 def transcribe_wav_bytes_batch(
@@ -294,7 +323,7 @@ def transcribe_wav_bytes_batch(
     cache_errors = 0
     for item in items:
         try:
-            text, words = transcribe_wav_bytes(
+            text, words, detected_language = transcribe_wav_bytes(
                 item["wav_bytes"],
                 wav_hash=item["wav_hash"],
                 stt_model=stt_model,
@@ -302,7 +331,12 @@ def transcribe_wav_bytes_batch(
                 device=device,
                 stt_cache_path=stt_cache_path,
             )
-            results.append({"text": text, "words": words, "error": None})
+            results.append({
+                "text": text,
+                "words": words,
+                "detected_language": detected_language,
+                "error": None,
+            })
         except Exception as exc:
             cache_errors += 1
             error_text = f"{type(exc).__name__}:{exc}"
@@ -313,7 +347,12 @@ def transcribe_wav_bytes_batch(
                 device,
                 error_text,
             )
-            results.append({"text": "", "words": [], "error": error_text})
+            results.append({
+                "text": "",
+                "words": [],
+                "detected_language": "",
+                "error": error_text,
+            })
     logger.info(
         "STT batch profile: items=%d errors=%d model=%s device=%s total_sec=%.3f",
         len(items),

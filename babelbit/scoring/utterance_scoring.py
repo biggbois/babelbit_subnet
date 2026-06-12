@@ -28,7 +28,7 @@ _EMPTY_TRANSCRIPT_MIN_DURATION_SEC = 0.5
 _DEFAULT_ACCURACY_THRESHOLD = 0.65
 _DEFAULT_RATE_LOWER = 0.3
 _DEFAULT_RATE_UPPER = 1.3
-_DEFAULT_LATENCY_OVERSHOOT_FRACTION = 0.3
+_DEFAULT_LATENCY_OVERSHOOT_FRACTION = 0.6
 _DEFAULT_LATENCY_MIN_OVERSHOOT_SEC = 2.0
 _DEFAULT_LATENCY_MAX_OVERSHOOT_SEC = 10.0
 _DEFAULT_LATENCY_POWER = 2.0
@@ -218,24 +218,15 @@ def _completion_sec_from_prediction(
     *,
     predicted_duration_sec: float,
 ) -> float:
-    """Use measured wall-clock completion when validators provide it.
 
-    Older callers only sent the first output frame and frame rate, which was an
-    audio-timeline approximation. Live S2S scoring should use the actual elapsed
-    time from miner init to out_eos so tiny canned responses cannot inherit a
-    plausible completion time from their decoded audio duration.
-    """
-    completion_sec = pred.get("completion_sec")
-    if completion_sec is not None:
-        try:
-            return max(0.0, float(completion_sec))
-        except (TypeError, ValueError):
-            pass
-
+    completion_sec: float = float(pred.get("completion_sec", 0.0) or 0.0)
     first_output_frame: int = int(pred.get("first_output_frame", 0) or 0)
     frame_rate_hz: float = float(pred.get("frame_rate_hz", 0.0) or 0.0)
     return (
-        (float(first_output_frame) / frame_rate_hz) + predicted_duration_sec
+        max(
+            completion_sec,
+            (float(first_output_frame) / frame_rate_hz) + predicted_duration_sec,
+        )
         if frame_rate_hz > 0
         else predicted_duration_sec
     )
@@ -285,7 +276,7 @@ def score_audio_utterance_bytes(
     )
     wav_hash = sha256(predicted_wav_bytes).hexdigest()
     try:
-        transcript_text, transcript_words = transcribe_wav_bytes(
+        transcript_text, transcript_words, detected_language = transcribe_wav_bytes(
             predicted_wav_bytes,
             wav_hash=wav_hash,
             stt_model=stt_model,
@@ -315,6 +306,19 @@ def score_audio_utterance_bytes(
     accuracy = compute_accuracy(
         transcript_text, metadata.reference_text, embedder_model
     )
+
+    # Language gate: if Whisper detected a language different from the target,
+    # the miner produced wrong-language audio (e.g. echoing the source).
+    # Force accuracy to 0 so the gate fails.
+    target_lang_lower = target_lang.lower().strip()
+    detected_lang_lower = detected_language.lower().strip()
+    if detected_lang_lower and detected_lang_lower != target_lang_lower:
+        logger.info(
+            "Language gate failed: expected=%s detected=%s — forcing accuracy=0",
+            target_lang_lower,
+            detected_lang_lower,
+        )
+        accuracy = 0.0
     speech_rate = compute_speech_rate_penalty(
         transcript_words,
         metadata.reference_wps,
@@ -452,11 +456,13 @@ def score_audio_utterance_batch(
         meta = pred_metadata[i]
         transcript_text = str(batch_result.get("text", ""))
         transcript_words = batch_result.get("words", [])
+        detected_language = str(batch_result.get("detected_language", ""))
         error = batch_result.get("error")
         transcriptions.append(
             {
                 "text": transcript_text,
                 "words": transcript_words,
+                "detected_language": detected_language,
                 "predicted_duration_sec": meta["predicted_duration_sec"],
                 "effective_completion_sec": meta["effective_completion_sec"],
                 "error": error,
@@ -469,6 +475,19 @@ def score_audio_utterance_batch(
     accuracies = compute_accuracy_batch(
         stt_texts, metadata.reference_text, embedder_model
     )
+    # Language gate: if Whisper detected a language different from the target,
+    # the miner produced wrong-language audio (e.g. echoing the source).
+    # Force accuracy to 0 so the gate fails.
+    target_lang_lower = target_lang.lower().strip()
+    for i, trans in enumerate(transcriptions):
+        detected = trans["detected_language"].lower().strip()
+        if detected and detected != target_lang_lower:
+            logger.info(
+                "Language gate failed: expected=%s detected=%s — forcing accuracy=0",
+                target_lang_lower,
+                detected,
+            )
+            accuracies[i] = 0.0
     accuracy_sec = perf_counter() - accuracy_started_at
 
     assembly_started_at = perf_counter()

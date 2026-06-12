@@ -249,11 +249,28 @@ def _resolve_s2s_audio_timeouts(
     return miner_timeout, init_timeout
 
 
-def _is_first_audio_utterance(payload: object) -> bool:
+def _audio_utterance_index(payload: object) -> int | None:
     utterance_id = str(getattr(payload, "utterance_id", "") or "").strip()
     if not utterance_id:
+        return None
+    if utterance_id == "0":
+        return 0
+    parts = utterance_id.rsplit(":", 1)
+    candidate = parts[-1]
+    if candidate.isdigit():
+        return int(candidate)
+    return None
+
+
+def _is_startup_audio_utterance(
+    payload: object, *, startup_utterance_count: int = 1
+) -> bool:
+    if startup_utterance_count <= 0:
+        return False
+    utterance_index = _audio_utterance_index(payload)
+    if utterance_index is None:
         return True
-    return utterance_id == "0" or utterance_id.endswith(":0")
+    return utterance_index < startup_utterance_count
 
 
 def _format_profile_seconds(value: Optional[float]) -> str:
@@ -486,7 +503,10 @@ async def _score_audio_miners_for_challenge(
 
 
 def _build_axon_audio_callbacks(
-    *, miner_timeout: float, init_timeout: float | None = None
+    *,
+    miner_timeout: float,
+    init_timeout: float | None = None,
+    startup_utterance_count: int = 1,
 ):
     from babelbit.utils.predict_engine import call_miner_axon_audio_endpoint
 
@@ -495,7 +515,9 @@ def _build_axon_audio_callbacks(
     async def init_callback(miner: Miner, payload: BBAudioMinerInitPayload) -> dict:
         request_timeout = (
             init_request_timeout
-            if _is_first_audio_utterance(payload)
+            if _is_startup_audio_utterance(
+                payload, startup_utterance_count=startup_utterance_count
+            )
             else miner_timeout
         )
         response = await call_miner_axon_audio_endpoint(
@@ -531,6 +553,7 @@ def _build_round2_audio_callbacks(
     routes_by_hotkey: Dict[str, ManagedRoute],
     miner_timeout: float,
     init_timeout: float | None = None,
+    startup_utterance_count: int = 1,
 ):
     from babelbit.utils.predict_engine import call_managed_route_audio_endpoint
 
@@ -554,7 +577,9 @@ def _build_round2_audio_callbacks(
         )
         request_timeout = (
             init_request_timeout
-            if _is_first_audio_utterance(payload)
+            if _is_startup_audio_utterance(
+                payload, startup_utterance_count=startup_utterance_count
+            )
             else miner_timeout
         )
         response = await call_managed_route_audio_endpoint(
@@ -1118,10 +1143,15 @@ async def runner_round2(
             settings=settings,
             challenge_type="arena",
         )
+        arena_startup_utterance_count = max(
+            1,
+            int(getattr(settings, "BB_ARENA_STARTUP_UTTERANCE_COUNT", 3)),
+        )
         init_audio_callback, predict_audio_callback = _build_round2_audio_callbacks(
             routes_by_hotkey=routes_by_hotkey,
             miner_timeout=arena_timeout,
             init_timeout=s2s_init_timeout,
+            startup_utterance_count=arena_startup_utterance_count,
         )
         _stderr_boot(
             "runner arena predict begin "

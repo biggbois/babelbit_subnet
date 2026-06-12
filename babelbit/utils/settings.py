@@ -63,6 +63,8 @@ class Settings(BaseModel):
     BB_ARENA_INIT_BARRIER_TIMEOUT_SEC: float
     BB_ARENA_INIT_KEEPALIVE_ENABLED: bool
     BB_ARENA_INIT_KEEPALIVE_INTERVAL_SEC: float
+    BB_ARENA_STARTUP_UTTERANCE_COUNT: int
+    BB_ARENA_MAX_CONSECUTIVE_UTTERANCE_FAILURES: int
     BB_ARENA_MINER_TIMEOUT_SEC: int
     BB_ARENA_INCENTIVE_PERCENT: float = 90.0
 
@@ -249,6 +251,12 @@ def get_settings() -> Settings:
         not in {"0", "false", "no", "off"},
         BB_ARENA_INIT_KEEPALIVE_INTERVAL_SEC=float(
             getenv("BB_ARENA_INIT_KEEPALIVE_INTERVAL_SEC", "30")
+        ),
+        BB_ARENA_STARTUP_UTTERANCE_COUNT=int(
+            getenv("BB_ARENA_STARTUP_UTTERANCE_COUNT", "3")
+        ),
+        BB_ARENA_MAX_CONSECUTIVE_UTTERANCE_FAILURES=int(
+            getenv("BB_ARENA_MAX_CONSECUTIVE_UTTERANCE_FAILURES", "2")
         ),
         BB_ARENA_MINER_TIMEOUT_SEC=int(getenv("BB_ARENA_MINER_TIMEOUT_SEC", "10")),
         BB_ARENA_INCENTIVE_PERCENT=float(getenv("BB_ARENA_INCENTIVE_PERCENT", "90")),

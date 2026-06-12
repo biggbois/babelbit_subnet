@@ -63,6 +63,16 @@ def _is_retryable_gateway_error(status: int, body: str) -> bool:
         return False
     if status in {404, 429, 503, 504}:
         return True
+    if status in {409, 410} and any(
+        marker in text
+        for marker in (
+            "upstream_error",
+            "upstream request failed",
+            "miner_unavailable",
+            "miner endpoint unavailable",
+        )
+    ):
+        return True
     return any(
         marker in text
         for marker in (
@@ -74,6 +84,10 @@ def _is_retryable_gateway_error(status: int, body: str) -> bool:
             "warming",
             "rate_limited",
             "upstream_unavailable",
+            "upstream_error",
+            "upstream request failed",
+            "miner_unavailable",
+            "miner endpoint unavailable",
         )
     )
 
