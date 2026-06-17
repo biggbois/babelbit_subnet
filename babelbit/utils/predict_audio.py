@@ -1073,6 +1073,45 @@ def _build_utterance_result(
             predicted_audio_bytes=b"",
         )
 
+    duplication_breakdown = score_result.get("duplicate_penalty", {})
+    duplication_score_breakdown = (
+        {
+            "raw_score": float(
+                duplication_breakdown.get(
+                    "raw_score", score_result.get("raw_score", score_result.get("score", 0.0))
+                )
+            ),
+            "final_score": float(
+                duplication_breakdown.get("final_score", score_result.get("score", 0.0))
+            ),
+            "penalty_factor": float(
+                duplication_breakdown.get(
+                    "penalty_factor",
+                    duplication_breakdown.get("penalty", 1.0),
+                )
+            ),
+            "duplicate_pressure": float(
+                duplication_breakdown.get("duplicate_pressure", 1.0)
+            ),
+            "max_peer_similarity": float(
+                duplication_breakdown.get(
+                    "max_peer_similarity",
+                    duplication_breakdown.get("max_similarity", 0.0),
+                )
+            ),
+            "similarity_threshold": float(
+                duplication_breakdown.get("similarity_threshold", 0.0)
+            ),
+            "gamma": float(duplication_breakdown.get("gamma", 0.0)),
+            "min_score_for_pressure": float(
+                duplication_breakdown.get("min_score_for_pressure", 0.0)
+            ),
+            "score_epsilon": float(duplication_breakdown.get("score_epsilon", 0.0)),
+        }
+        if duplication_breakdown
+        else {}
+    )
+
     return BBAudioUtteranceResult(
         challenge_uid=pred.ue_utterance.challenge_uid,
         utterance_index=pred.ue_utterance.utterance_index,
@@ -1109,6 +1148,11 @@ def _build_utterance_result(
         score_breakdown={
             "speech_rate": score_result.get("speech_rate", {}),
             "latency": score_result.get("latency", {}),
+            **(
+                {"duplication": duplication_score_breakdown}
+                if duplication_score_breakdown
+                else {}
+            ),
             **(
                 {"score_error": score_result["score_error"]}
                 if "score_error" in score_result
@@ -1650,18 +1694,23 @@ async def predict_source_audio_multi_miner(
                 reference_metadata=reference_metadata,
             )
             utterance_results.append(utterance_result)
+            duplication = utterance_result.score_breakdown.get("duplication", {})
             logger.info(
-                "S2S audio score summary: challenge=%s utterance=%s %s score=%.6f accuracy=%.6f latency=%.6f score_method=%s fallback=%s",
+                "S2S audio score summary: challenge=%s utterance=%s %s score=%.6f raw_score=%.6f accuracy=%.6f latency=%.6f dup_pressure=%.6f dup_penalty=%.6f max_peer_similarity=%.6f score_method=%s fallback=%s",
                 utterance_result.challenge_uid,
                 utterance_result.utterance_id,
                 _miner_log_label(pred.miner),
                 utterance_result.score,
+                float(duplication.get("raw_score", utterance_result.score)),
                 utterance_result.accuracy,
                 float(
                     utterance_result.score_breakdown.get("latency", {}).get(
                         "score", 0.0
                     )
                 ),
+                float(duplication.get("duplicate_pressure", 1.0)),
+                float(duplication.get("penalty_factor", 1.0)),
+                float(duplication.get("max_peer_similarity", 0.0)),
                 utterance_result.score_method,
                 utterance_result.score_is_fallback,
             )

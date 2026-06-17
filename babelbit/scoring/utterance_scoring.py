@@ -8,6 +8,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
 from babelbit.scoring.reference_metadata import resolve_audio_reference_metadata
@@ -18,6 +19,7 @@ from babelbit.scoring.text_embeddings import (
     embed_text,
     embed_texts_batch,
     get_reference_embedding,
+    get_text_embeddings_cached,
 )
 from babelbit.utils.settings import get_settings
 
@@ -32,6 +34,10 @@ _DEFAULT_LATENCY_OVERSHOOT_FRACTION = 0.6
 _DEFAULT_LATENCY_MIN_OVERSHOOT_SEC = 2.0
 _DEFAULT_LATENCY_MAX_OVERSHOOT_SEC = 10.0
 _DEFAULT_LATENCY_POWER = 2.0
+_DEFAULT_DUPLICATION_SIMILARITY_THRESHOLD = 0.88
+_DEFAULT_DUPLICATION_GAMMA = 0.5
+_DEFAULT_DUPLICATION_MIN_SCORE_FOR_PRESSURE = 0.0
+_DEFAULT_DUPLICATION_SCORE_EPSILON = 0.1
 logger = getLogger(__name__)
 
 
@@ -104,6 +110,151 @@ def compute_accuracy_batch(
         results[orig_idx] = max(0.0, min(1.0, sim))
 
     return results
+
+
+def apply_pairwise_duplication_penalty(
+    *,
+    raw_scores: List[float],
+    texts: List[str],
+    embedder_model: str,
+    similarity_threshold: float = _DEFAULT_DUPLICATION_SIMILARITY_THRESHOLD,
+    gamma: float = _DEFAULT_DUPLICATION_GAMMA,
+    min_score_for_pressure: float = _DEFAULT_DUPLICATION_MIN_SCORE_FOR_PRESSURE,
+    score_epsilon: float = _DEFAULT_DUPLICATION_SCORE_EPSILON,
+    embeddings: Optional[torch.Tensor] = None,
+    debug: bool = False,
+) -> List[Dict[str, float]]:
+    """Apply soft pairwise duplicate pressure within one challenge batch.
+
+    This avoids hard clustering: every response receives pressure from every
+    sufficiently similar high-scoring peer, so near-duplicates are penalized
+    smoothly while unrelated prompts/challenges are never compared here.
+    """
+    if not raw_scores:
+        return []
+
+    count = len(raw_scores)
+    if count != len(texts):
+        raise ValueError("raw_scores and texts must have the same length")
+
+    safe_raw_scores = torch.nan_to_num(
+        torch.as_tensor(raw_scores, dtype=torch.float32),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).clamp(min=0.0)
+    if count == 1:
+        return [
+            {
+                "raw_score": round(float(safe_raw_scores[0]), 6),
+                "final_score": round(float(safe_raw_scores[0]), 6),
+                "max_similarity": 0.0,
+                "duplicate_pressure": 1.0,
+                "penalty": 1.0,
+            }
+        ]
+
+    threshold = max(0.0, min(float(similarity_threshold), 0.999999))
+    gamma = max(0.0, float(gamma))
+    min_score_for_pressure = max(0.0, float(min_score_for_pressure))
+
+    try:
+        embedding_matrix = embeddings
+        if embedding_matrix is None:
+            embedding_matrix = get_text_embeddings_cached(texts, embedder_model)
+        embedding_matrix = torch.as_tensor(embedding_matrix, dtype=torch.float32)
+        if embedding_matrix.ndim != 2 or embedding_matrix.shape[0] != count:
+            raise ValueError("invalid duplicate embedding shape")
+        embedding_matrix = torch.nan_to_num(
+            embedding_matrix, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        norms = embedding_matrix.norm(dim=1, keepdim=True)
+        normalized = torch.where(
+            norms > 0.0,
+            embedding_matrix / norms.clamp_min(1e-12),
+            torch.zeros_like(embedding_matrix),
+        )
+        similarities = torch.nan_to_num(
+            normalized @ normalized.T, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        similarities = similarities.clamp(min=-1.0, max=1.0)
+        similarities.fill_diagonal_(0.0)
+
+        # Convert cosine similarity into a soft duplicate weight in [0, 1].
+        # Below the threshold, peers exert no duplicate pressure.
+        weights = ((similarities - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
+        # Absolute gate on whether a miner can exert any pressure at all.
+        # With the default of 0.0, this is effectively just the raw score.
+        pressure_scores = torch.where(
+            safe_raw_scores >= min_score_for_pressure,
+            safe_raw_scores,
+            torch.zeros_like(safe_raw_scores),
+        )
+        if score_epsilon > 0.0:
+            # Entry [i, j] is raw_score_j - raw_score_i.
+            # A slightly weaker peer can still exert partial pressure within
+            # the epsilon band; a clearly weaker peer contributes zero.
+            score_deltas = pressure_scores.unsqueeze(0) - safe_raw_scores.unsqueeze(1)
+            relative_weights = ((score_deltas + score_epsilon) / score_epsilon).clamp(
+                0.0, 1.0
+            )
+        else:
+            # Fallback to a hard directional rule: only equal-or-stronger peers
+            # penalize a miner.
+            relative_weights = (
+                pressure_scores.unsqueeze(0) >= safe_raw_scores.unsqueeze(1)
+            ).to(torch.float32)
+        # Entry [i, j] is the pressure miner j exerts on miner i:
+        # similarity weight * peer score * relative competitiveness.
+        contributions = weights * pressure_scores.unsqueeze(0) * relative_weights
+        duplicate_pressure = 1.0 + contributions.sum(dim=1)
+        penalties = 1.0 / duplicate_pressure.clamp_min(1e-12).pow(gamma)
+        final_scores = safe_raw_scores * penalties
+        max_similarities = similarities.max(dim=1).values.clamp(min=0.0)
+    except Exception as exc:
+        logger.warning("Duplicate penalty skipped: %s", exc)
+        max_similarities = torch.zeros(count, dtype=torch.float32)
+        duplicate_pressure = torch.ones(count, dtype=torch.float32)
+        penalties = torch.ones(count, dtype=torch.float32)
+        final_scores = safe_raw_scores
+
+    adjustments = []
+    for i in range(count):
+        adjustments.append(
+            {
+                "raw_score": round(float(safe_raw_scores[i]), 6),
+                "final_score": round(float(final_scores[i]), 6),
+                "max_similarity": round(float(max_similarities[i]), 6),
+                "duplicate_pressure": round(float(duplicate_pressure[i]), 6),
+                "penalty": round(float(penalties[i]), 6),
+            }
+        )
+
+    if debug:
+        lower_triangle = np.tril(similarities.detach().cpu().numpy())
+        logger.debug(
+            "Duplicate similarity matrix lower_triangle shape=%s values=\n%s",
+            tuple(similarities.shape),
+            np.array2string(
+                lower_triangle,
+                precision=4,
+                suppress_small=True,
+                max_line_width=200,
+            ),
+        )
+        for i, adjustment in enumerate(adjustments):
+            logger.debug(
+                "Duplicate penalty: index=%d max_similarity=%.6f duplicate_pressure=%.6f "
+                "penalty=%.6f raw_score=%.6f final_score=%.6f",
+                i,
+                adjustment["max_similarity"],
+                adjustment["duplicate_pressure"],
+                adjustment["penalty"],
+                adjustment["raw_score"],
+                adjustment["final_score"],
+            )
+
+    return adjustments
 
 
 def compute_speech_rate_penalty(
@@ -588,12 +739,84 @@ def score_audio_utterance_batch(
         )
 
     assembly_sec = perf_counter() - assembly_started_at
+    duplicate_started_at = perf_counter()
+    adjustments = apply_pairwise_duplication_penalty(
+        raw_scores=[float(result.get("score", 0.0) or 0.0) for result in results],
+        texts=[str(result.get("stt_text", "")) for result in results],
+        embedder_model=embedder_model,
+        similarity_threshold=getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_SIMILARITY_THRESHOLD",
+            _DEFAULT_DUPLICATION_SIMILARITY_THRESHOLD,
+        ),
+        gamma=getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_GAMMA",
+            _DEFAULT_DUPLICATION_GAMMA,
+        ),
+        min_score_for_pressure=getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_MIN_SCORE_FOR_PRESSURE",
+            _DEFAULT_DUPLICATION_MIN_SCORE_FOR_PRESSURE,
+        ),
+        score_epsilon=getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_SCORE_EPSILON",
+            _DEFAULT_DUPLICATION_SCORE_EPSILON,
+        ),
+        debug=logger.isEnabledFor(10),
+    )
+    duplicate_similarity_threshold = float(
+        getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_SIMILARITY_THRESHOLD",
+            _DEFAULT_DUPLICATION_SIMILARITY_THRESHOLD,
+        )
+    )
+    duplicate_gamma = float(
+        getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_GAMMA",
+            _DEFAULT_DUPLICATION_GAMMA,
+        )
+    )
+    duplicate_min_score_for_pressure = float(
+        getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_MIN_SCORE_FOR_PRESSURE",
+            _DEFAULT_DUPLICATION_MIN_SCORE_FOR_PRESSURE,
+        )
+    )
+    duplicate_score_epsilon = float(
+        getattr(
+            settings,
+            "BB_AUDIO_SCORING_DUPLICATION_SCORE_EPSILON",
+            _DEFAULT_DUPLICATION_SCORE_EPSILON,
+        )
+    )
+    for result, adjustment in zip(results, adjustments):
+        result["raw_score"] = adjustment["raw_score"]
+        result["score"] = adjustment["final_score"]
+        result["duplicate_penalty"] = {
+            "raw_score": adjustment["raw_score"],
+            "final_score": adjustment["final_score"],
+            "penalty_factor": adjustment["penalty"],
+            "duplicate_pressure": adjustment["duplicate_pressure"],
+            "max_peer_similarity": adjustment["max_similarity"],
+            "similarity_threshold": round(duplicate_similarity_threshold, 6),
+            "gamma": round(duplicate_gamma, 6),
+            "min_score_for_pressure": round(duplicate_min_score_for_pressure, 6),
+            "score_epsilon": round(duplicate_score_epsilon, 6),
+            "max_similarity": adjustment["max_similarity"],
+            "penalty": adjustment["penalty"],
+        }
+    duplicate_sec = perf_counter() - duplicate_started_at
     total_sec = perf_counter() - batch_started_at
     logger.info(
         "Audio scoring batch profile: challenge=%s utterance=%s predictions=%d "
         "total_predicted_audio_sec=%.3f prep_sec=%.3f reference_embed_sec=%.3f "
         "stt_sec=%.3f transcription_sec=%.3f accuracy_embed_sec=%.3f "
-        "assembly_sec=%.3f total_sec=%.3f stt_model=%s stt_device=%s embedder=%s",
+        "assembly_sec=%.3f duplicate_sec=%.3f total_sec=%.3f stt_model=%s stt_device=%s embedder=%s",
         challenge_uid,
         utterance_id,
         len(predictions),
@@ -604,6 +827,7 @@ def score_audio_utterance_batch(
         transcription_sec,
         accuracy_sec,
         assembly_sec,
+        duplicate_sec,
         total_sec,
         stt_model,
         stt_device,
@@ -647,6 +871,7 @@ def _build_error_score_result(
 __all__ = [
     "DEFAULT_EMBEDDER",
     "SEMANTIC_AUDIO_SCORING_MODE",
+    "apply_pairwise_duplication_penalty",
     "compute_accuracy",
     "compute_accuracy_batch",
     "compute_latency_score",

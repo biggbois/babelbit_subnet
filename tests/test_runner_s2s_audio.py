@@ -2,6 +2,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import numpy as np
 import re
 import tarfile
@@ -15,6 +16,7 @@ import pytest
 from babelbit.cli.runner import (
     _build_axon_audio_callbacks,
     _build_round2_audio_callbacks,
+    _enforce_runner_logging_level,
     _resolve_round2_routes_when_ready,
     runner,
     runner_round2,
@@ -2454,9 +2456,21 @@ async def test_predict_source_audio_multi_miner_returns_partial_results_on_next_
             return_value=[
                 {
                     "score": 0.42,
+                    "raw_score": 0.84,
                     "accuracy": 0.7,
                     "speech_rate": {"penalty": 0.8},
                     "latency": {"score": 0.75},
+                    "duplicate_penalty": {
+                        "raw_score": 0.84,
+                        "final_score": 0.42,
+                        "penalty_factor": 0.5,
+                        "duplicate_pressure": 4.0,
+                        "max_peer_similarity": 0.99,
+                        "similarity_threshold": 0.88,
+                        "gamma": 0.5,
+                        "min_score_for_pressure": 0.2,
+                        "score_epsilon": 0.02,
+                    },
                     "stt_text": "hello there",
                     "gt_text": "hello world",
                     "predicted_duration_sec": 0.5,
@@ -2567,9 +2581,21 @@ async def test_predict_source_audio_multi_miner_applies_real_scores():
             return_value=[
                 {
                     "score": 0.42,
+                    "raw_score": 0.84,
                     "accuracy": 0.7,
                     "speech_rate": {"penalty": 0.8},
                     "latency": {"score": 0.75},
+                    "duplicate_penalty": {
+                        "raw_score": 0.84,
+                        "final_score": 0.42,
+                        "penalty_factor": 0.5,
+                        "duplicate_pressure": 4.0,
+                        "max_peer_similarity": 0.99,
+                        "similarity_threshold": 0.88,
+                        "gamma": 0.5,
+                        "min_score_for_pressure": 0.2,
+                        "score_epsilon": 0.02,
+                    },
                     "stt_text": "hello there",
                     "gt_text": "hello world",
                     "predicted_duration_sec": 0.5,
@@ -2581,6 +2607,7 @@ async def test_predict_source_audio_multi_miner_applies_real_scores():
                 }
             ],
         ),
+        patch("babelbit.utils.predict_audio.logger") as mock_logger,
     ):
         challenge_uid, results = await predict_source_audio_multi_miner(
             utterance_engine_url="http://ue.test",
@@ -2606,6 +2633,39 @@ async def test_predict_source_audio_multi_miner_applies_real_scores():
     assert utterance.scoring_metadata_source == "/tmp/metadata/challenge.json"
     assert utterance.score_breakdown["speech_rate"]["penalty"] == 0.8
     assert utterance.score_breakdown["latency"]["score"] == 0.75
+    assert utterance.score_breakdown["duplication"] == {
+        "raw_score": 0.84,
+        "final_score": 0.42,
+        "penalty_factor": 0.5,
+        "duplicate_pressure": 4.0,
+        "max_peer_similarity": 0.99,
+        "similarity_threshold": 0.88,
+        "gamma": 0.5,
+        "min_score_for_pressure": 0.2,
+        "score_epsilon": 0.02,
+    }
+    info_messages = [call.args[0] for call in mock_logger.info.call_args_list if call.args]
+    assert (
+        "S2S audio score summary: challenge=%s utterance=%s %s score=%.6f raw_score=%.6f "
+        "accuracy=%.6f latency=%.6f dup_pressure=%.6f dup_penalty=%.6f "
+        "max_peer_similarity=%.6f score_method=%s fallback=%s"
+    ) in info_messages
+
+
+def test_enforce_runner_logging_level_preserves_debug_when_requested():
+    root_logger = logging.getLogger()
+    babelbit_logger = logging.getLogger("babelbit")
+    previous_root = root_logger.level
+    previous_babelbit = babelbit_logger.level
+
+    try:
+        root_logger.setLevel(logging.DEBUG)
+        babelbit_logger.setLevel(logging.INFO)
+        _enforce_runner_logging_level()
+        assert babelbit_logger.level == logging.DEBUG
+    finally:
+        root_logger.setLevel(previous_root)
+        babelbit_logger.setLevel(previous_babelbit)
 
 
 @pytest.mark.asyncio

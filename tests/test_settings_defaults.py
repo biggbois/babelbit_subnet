@@ -15,6 +15,10 @@ def test_audio_scoring_metadata_root_defaults_to_cache_dir(monkeypatch, tmp_path
             .expanduser()
             .resolve()
         )
+        assert settings.BB_AUDIO_SCORING_DUPLICATION_SIMILARITY_THRESHOLD == 0.88
+        assert settings.BB_AUDIO_SCORING_DUPLICATION_GAMMA == 0.5
+        assert settings.BB_AUDIO_SCORING_DUPLICATION_MIN_SCORE_FOR_PRESSURE == 0.0
+        assert settings.BB_AUDIO_SCORING_DUPLICATION_SCORE_EPSILON == 0.02
     finally:
         get_settings.cache_clear()
 

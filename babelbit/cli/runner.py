@@ -2,7 +2,7 @@ import gc
 from datetime import datetime
 from functools import lru_cache
 from typing import List, Optional, Dict, Tuple
-from logging import INFO, getLogger
+from logging import DEBUG, INFO, getLogger
 import os
 import sys
 import subprocess
@@ -200,8 +200,9 @@ def _stderr_boot(message: str) -> None:
 
 
 def _enforce_runner_logging_level() -> None:
-    """Keep runner loggers at INFO+ even if external libs mutate log levels."""
+    """Keep runner loggers visible without downgrading explicit DEBUG mode."""
     try:
+        target_level = DEBUG if getLogger().getEffectiveLevel() <= DEBUG else INFO
         for name in (
             "babelbit",
             "babelbit.cli.runner",
@@ -209,7 +210,7 @@ def _enforce_runner_logging_level() -> None:
             "babelbit.utils.predict_engine",
             "babelbit.utils.managed_container_registry",
         ):
-            getLogger(name).setLevel(INFO)
+            getLogger(name).setLevel(target_level)
     except Exception:
         pass
 
