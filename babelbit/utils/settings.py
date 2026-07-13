@@ -190,12 +190,8 @@ def get_settings() -> Settings:
         BB_AUDIO_SCORING_ACCURACY_THRESHOLD=float(
             getenv("BB_AUDIO_SCORING_ACCURACY_THRESHOLD", "0.65")
         ),
-        BB_AUDIO_SCORING_RATE_LOWER=float(
-            getenv("BB_AUDIO_SCORING_RATE_LOWER", "0.3")
-        ),
-        BB_AUDIO_SCORING_RATE_UPPER=float(
-            getenv("BB_AUDIO_SCORING_RATE_UPPER", "1.3")
-        ),
+        BB_AUDIO_SCORING_RATE_LOWER=float(getenv("BB_AUDIO_SCORING_RATE_LOWER", "0.3")),
+        BB_AUDIO_SCORING_RATE_UPPER=float(getenv("BB_AUDIO_SCORING_RATE_UPPER", "1.3")),
         BB_AUDIO_SCORING_LATENCY_OVERSHOOT_FRACTION=float(
             getenv("BB_AUDIO_SCORING_LATENCY_OVERSHOOT_FRACTION", "0.3")
         ),
@@ -223,7 +219,7 @@ def get_settings() -> Settings:
         BB_RUNNER_ON_STARTUP=getenv("BB_RUNNER_ON_STARTUP", "false").strip().lower()
         in ("1", "true", "yes"),
         BB_SUBMIT_API_URL=getenv("BB_SUBMIT_API_URL", "https://scoring.babelbit.ai"),
-        BB_ENABLE_ARENA_CHALLENGE=getenv("BB_ENABLE_ARENA_CHALLENGE", "true")
+        BB_ENABLE_ARENA_CHALLENGE=getenv("BB_ENABLE_ARENA_CHALLENGE", "false")
         .strip()
         .lower()
         in ("1", "true", "yes"),

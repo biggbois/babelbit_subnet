@@ -2,7 +2,7 @@ import asyncio
 import base64
 import io
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from logging import getLogger
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -138,6 +138,7 @@ class _MinerUtteranceSession:
     frame_samples: int
     input_frames: List[bytes]
     output_chunks: List[bytes]
+    output_chunk_frames: List[int] = field(default_factory=list)
     first_output_frame: Optional[int] = None
     saw_out_eos: bool = False
     last_input_chunk_sent_at: Optional[float] = None
@@ -611,6 +612,35 @@ def _miner_output_frame_count(
     return sum(len(chunk) for chunk in output_chunks) // bytes_per_frame
 
 
+def _playback_completion_sec(session: _MinerUtteranceSession) -> float:
+    """Time at which the miner's output audio could finish playing back.
+
+    Each output chunk can start playing no earlier than the frame on which it
+    arrived, and chunks play back serially.  Folding that over every chunk
+    gives the true completion time of the audible translation.  Using only the
+    first output frame (or the out_eos frame) lets a miner emit a tiny early
+    placeholder chunk, dump the real audio after source EOS, and inherit a
+    near-zero latency overshoot despite being fully non-streaming.
+    """
+    if session.frame_rate_hz <= 0:
+        return 0.0
+    eos_sec = float(session.completed_frame or 0) / session.frame_rate_hz
+    bytes_per_sec = (
+        session.miner_audio.sample_rate_hz
+        * session.miner_audio.channels
+        * session.miner_audio.sample_width_bytes
+    )
+    if bytes_per_sec <= 0:
+        return eos_sec
+    playback_end_sec = 0.0
+    for arrival_frame, chunk in zip(session.output_chunk_frames, session.output_chunks):
+        arrival_sec = float(arrival_frame) / session.frame_rate_hz
+        playback_end_sec = max(playback_end_sec, arrival_sec) + (
+            len(chunk) / float(bytes_per_sec)
+        )
+    return max(playback_end_sec, eos_sec)
+
+
 def _prediction_success(session: _MinerUtteranceSession) -> _RawPrediction:
     if not session.saw_out_eos:
         raise AudioChallengeError("Miner never signaled out_eos=true")
@@ -624,11 +654,7 @@ def _prediction_success(session: _MinerUtteranceSession) -> _RawPrediction:
         channels=session.miner_audio.channels,
         sample_width_bytes=2,
     )
-    completion_sec = (
-        float(session.completed_frame) / session.frame_rate_hz
-        if session.frame_rate_hz > 0
-        else 0.0
-    )
+    completion_sec = _playback_completion_sec(session)
     latency_ms = completion_sec * 1000.0
     output_frame_count = _miner_output_frame_count(
         session.output_chunks,
@@ -919,6 +945,7 @@ async def _predict_frame_for_miner(
             session.first_output_frame = frame_index + 1
         decoded_out = base64.b64decode(predict_response.audio_b64)
         session.output_chunks.append(decoded_out)
+        session.output_chunk_frames.append(frame_index + 1)
         out_bytes = len(decoded_out)
     logger.info(
         "S2S audio frame recv: challenge=%s utterance=%s %s frame=%d/%d bytes_out=%d out_eos=%s",
@@ -996,6 +1023,7 @@ async def _drain_miner_until_eos(
                 session.first_output_frame = total_frames + drain_index + 1
             decoded_out = base64.b64decode(predict_response.audio_b64)
             session.output_chunks.append(decoded_out)
+            session.output_chunk_frames.append(total_frames + drain_index + 1)
             out_bytes = len(decoded_out)
         logger.info(
             "S2S audio drain recv: challenge=%s utterance=%s %s drain=%d/%d bytes_out=%d out_eos=%s",

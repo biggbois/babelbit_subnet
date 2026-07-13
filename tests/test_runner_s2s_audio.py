@@ -1057,8 +1057,10 @@ async def test_predict_source_audio_multi_miner_uses_frame_time_for_completion()
 
     assert results["fast"].utterances[0].completed is True
     assert results["slow"].utterances[0].completed is True
-    assert captured_predictions[0]["completion_sec"] == pytest.approx(0.08)
-    assert captured_predictions[1]["completion_sec"] == pytest.approx(0.08)
+    # Output chunk arrives with frame 1 (0.08 s) and holds 0.08 s of audio,
+    # so playback-based completion is 0.16 s.
+    assert captured_predictions[0]["completion_sec"] == pytest.approx(0.16)
+    assert captured_predictions[1]["completion_sec"] == pytest.approx(0.16)
 
 
 @pytest.mark.asyncio
