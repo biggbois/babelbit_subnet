@@ -40,14 +40,14 @@ class _GatewayState:
                 primary = settings.BITTENSOR_SUBTENSOR_ENDPOINT
                 fallback = settings.BITTENSOR_SUBTENSOR_FALLBACK
                 logger.info("[gateway] connecting subtensor primary=%s", primary)
-                self.subtensor = bt.async_subtensor(primary)
+                self.subtensor = bt.AsyncSubtensor(network=primary)
                 try:
                     await self.subtensor.initialize()
                     self.created_at = time.monotonic()
                     logger.info("[gateway] subtensor connected primary=%s", primary)
                 except Exception as e:
                     logger.warning("[gateway] primary failed: %s", e)
-                    self.subtensor = bt.async_subtensor(fallback)
+                    self.subtensor = bt.AsyncSubtensor(network=fallback)
                     await self.subtensor.initialize()
                     self.created_at = time.monotonic()
                     logger.info("[gateway] subtensor connected fallback=%s", fallback)
@@ -196,7 +196,7 @@ async def run_subtensor_gateway() -> None:
     settings = get_settings()
     host = settings.SUBTENSOR_GATEWAY_HOST
     port = settings.SUBTENSOR_GATEWAY_PORT
-    wallet = bt.wallet(
+    wallet = bt.Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )

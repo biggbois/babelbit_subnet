@@ -7,8 +7,8 @@ import os
 from pathlib import Path
 
 import click
-from substrateinterface import Keypair
-from bittensor import wallet, async_subtensor
+from bittensor_wallet import Keypair
+from bittensor import AsyncSubtensor, Wallet
 
 from babelbit.utils.settings import get_settings
 logger = getLogger(__name__)
@@ -38,7 +38,7 @@ def load_hotkey_keypair(wallet_name: str, hotkey_name: str) -> Keypair:
         kwargs = {"name": wallet_name, "hotkey": hotkey_name}
         if wallet_path.name != "wallets" or wallet_path.parent.name != ".bittensor":
             kwargs["path"] = str(wallet_path)
-        bt_wallet = wallet(**kwargs)
+        bt_wallet = Wallet(**kwargs)
         keypair = bt_wallet.hotkey
         logger.info(
             "Loaded hotkey keypair from Bittensor wallet name=%s hotkey=%s path=%s",
@@ -78,7 +78,7 @@ async def get_subtensor():
 
     if _SUBTENSOR is None:
         logger.info("🔗 Connecting to Bittensor subtensor: %s", settings.BITTENSOR_SUBTENSOR_ENDPOINT)
-        _SUBTENSOR = async_subtensor(settings.BITTENSOR_SUBTENSOR_ENDPOINT)
+        _SUBTENSOR = AsyncSubtensor(network=settings.BITTENSOR_SUBTENSOR_ENDPOINT)
         try:
             await _SUBTENSOR.initialize()
             logger.info("✅ Bittensor connection established: %s", settings.BITTENSOR_SUBTENSOR_ENDPOINT)
@@ -87,7 +87,7 @@ async def get_subtensor():
             logger.info("� Troubleshooting: If using local subtensor, ensure it's running and accessible at %s", settings.BITTENSOR_SUBTENSOR_ENDPOINT)
             logger.info("💡 SSL errors often indicate protocol mismatch - check if your local node expects wss:// or ws://")
             logger.info("�🔄 Attempting fallback connection: %s", settings.BITTENSOR_SUBTENSOR_FALLBACK)
-            _SUBTENSOR = async_subtensor(settings.BITTENSOR_SUBTENSOR_FALLBACK)
+            _SUBTENSOR = AsyncSubtensor(network=settings.BITTENSOR_SUBTENSOR_FALLBACK)
             await _SUBTENSOR.initialize()
             logger.info("✅ Fallback Bittensor connection established: %s", settings.BITTENSOR_SUBTENSOR_FALLBACK)
     return _SUBTENSOR
@@ -233,7 +233,7 @@ async def test_metagraph() -> bool:
         logger.info(f"Hot wallet: {wallet_hot}")
 
         try:
-            w = wallet(
+            w = Wallet(
                 name=wallet_cold.get_secret_value(),
                 hotkey=wallet_hot.get_secret_value(),
             )

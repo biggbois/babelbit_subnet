@@ -30,9 +30,7 @@ FROM base AS prod-dependencies
 COPY pyproject.toml README.md ./
 
 # Install production dependencies
-RUN pip install --no-cache-dir . \
-    && pip uninstall -y cyscale || true \
-    && pip install --no-cache-dir --force-reinstall scalecodec==1.2.12 async-substrate-interface==1.5.12
+RUN pip install --no-cache-dir .
 
 
 # Stage 3: Test dependencies - extends production dependencies
@@ -54,9 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY . /app
 
 # Install package in editable mode (dependencies already installed)
-RUN pip install --no-cache-dir --no-deps -e . \
-    && pip uninstall -y cyscale || true \
-    && pip install --no-cache-dir --force-reinstall scalecodec==1.2.12 async-substrate-interface==1.5.12
+RUN pip install --no-cache-dir --no-deps -e .
 
 # Run tests and write a success marker if they pass
 RUN python -m pytest tests/ -v --tb=short && touch /tests-passed
@@ -73,9 +69,7 @@ COPY --from=prod-dependencies /usr/local/bin /usr/local/bin
 COPY . /app
 
 # Install package (non-editable, dependencies already present)
-RUN pip install --no-cache-dir --no-deps . \
-    && pip uninstall -y cyscale || true \
-    && pip install --no-cache-dir --force-reinstall scalecodec==1.2.12 async-substrate-interface==1.5.12
+RUN pip install --no-cache-dir --no-deps .
 
 ENV PATH="/root/.local/bin:$PATH"
 

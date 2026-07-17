@@ -1,7 +1,7 @@
 from json import loads
 
 from aiohttp import ClientTimeout, ClientSession
-from substrateinterface import Keypair
+from bittensor_wallet import Keypair
 
 from babelbit.utils.settings import get_settings
 

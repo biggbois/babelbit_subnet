@@ -12,8 +12,7 @@ authors = [{ name = "Babelbit" }]
 
 # Core runtime deps
 dependencies = [
-  "substrate-interface",
-  "async-substrate-interface==1.5.15",
+  "async-substrate-interface==2.2.1",
   "pydantic>=2",
   "httpx",
   "python-dotenv>=0.21.0",
@@ -22,7 +21,7 @@ dependencies = [
   "opencv-python>=4.8",
   "click>=8.0.0",
   "huggingface_hub>=0.24",
-  "bittensor==9.12.2",
+  "bittensor==10.5.0",
   "torch==2.9.0",
   "aiobotocore==2.13.1",
   "numpy>=1.24",

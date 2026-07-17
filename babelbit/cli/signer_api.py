@@ -26,7 +26,7 @@ async def reset_subtensor():
 
 
 async def _set_weights_with_confirmation(
-    wallet: "bt.wallet",
+    wallet: "bt.Wallet",
     netuid: int,
     uids: list[int],
     weights: list[float],
@@ -49,7 +49,7 @@ async def _set_weights_with_confirmation(
 
 
 async def _set_weights_with_confirmation_response(
-    wallet: "bt.wallet",
+    wallet: "bt.Wallet",
     netuid: int,
     uids: list[int],
     weights: list[float],
@@ -106,7 +106,7 @@ async def run_signer() -> None:
     # Wallet Bittensor
     cold = settings.BITTENSOR_WALLET_COLD
     hot = settings.BITTENSOR_WALLET_HOT
-    wallet = bt.wallet(name=cold, hotkey=hot)
+    wallet = bt.Wallet(name=cold, hotkey=hot)
 
     @web.middleware
     async def access_log(request: web.Request, handler):

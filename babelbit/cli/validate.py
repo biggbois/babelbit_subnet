@@ -225,7 +225,7 @@ async def _validate_main(tail: int, alpha: float, m_min: int, tempo: int):
 
     NETUID = settings.BABELBIT_NETUID
 
-    wallet = bt.wallet(
+    wallet = bt.Wallet(
         name=settings.BITTENSOR_WALLET_COLD,
         hotkey=settings.BITTENSOR_WALLET_HOT,
     )
