@@ -148,6 +148,11 @@ def _meta_snapshot(meta: Any) -> dict[str, Any]:
     }
 
 
+def _registry_context_response(meta: Any) -> dict[str, Any]:
+    """Build runner registry data without querying obsolete commitments."""
+    return {"metagraph": _meta_snapshot(meta), "commitments": {}}
+
+
 def _serialize_commitments(commits: dict[str, Any]) -> dict[str, list[list[Any]]]:
     out: dict[str, list[list[Any]]] = {}
     for hotkey, arr in (commits or {}).items():
@@ -267,15 +272,8 @@ async def run_subtensor_gateway() -> None:
         payload = await req.json()
         netuid = int(payload.get("netuid", os.getenv("BABELBIT_NETUID", "59")))
         lite = bool(payload.get("lite", False))
-        st = await STATE.get_subtensor()
         meta = await STATE.metagraph(netuid=netuid, lite=lite)
-        commits = await st.get_all_revealed_commitments(netuid)
-        return web.json_response(
-            {
-                "metagraph": _meta_snapshot(meta),
-                "commitments": _serialize_commitments(commits),
-            }
-        )
+        return web.json_response(_registry_context_response(meta))
 
     async def set_weights_and_confirm_handler(req: web.Request):
         payload = await req.json()
