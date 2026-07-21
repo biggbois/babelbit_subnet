@@ -424,6 +424,7 @@ def main() -> int:
         drain_timeout_sec=30.0,
         drain_max_requests=16,
         final_drain_min_timeout_sec=10.0,
+        pace_realtime=bool(args.validator_mode),
     )
 
     try:

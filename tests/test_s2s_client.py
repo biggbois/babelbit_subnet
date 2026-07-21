@@ -78,6 +78,45 @@ def test_run_s2s_utterance_times_out_on_slow_frame(monkeypatch) -> None:
     )
     assert result.prediction_error is not None
     assert "timed out after 3.00s" in result.prediction_error
+
+
+def test_pace_realtime_sleeps_between_frames(monkeypatch) -> None:
+    import httpx
+
+    sleeps: list[float] = []
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+            self.status_code = 200
+            self.text = ""
+
+        def json(self) -> dict[str, object]:
+            return self._payload
+
+    class _FakeClient:
+        def post(self, url: str, json: dict[str, object], timeout: httpx.Timeout) -> _FakeResponse:
+            if json.get("kind") == "init":
+                return _FakeResponse({"session_id": "sess-1"})
+            return _FakeResponse({"audio_b64": "", "out_eos": bool(json.get("in_eos")), "n_bytes": 0})
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("babelbit.benchmarks.s2s_client.time.sleep", lambda s: sleeps.append(s))
+    run_s2s_utterance(
+        "http://miner.test",
+        S2sUtteranceRequest(
+            frames=[b"a" * 4, b"b" * 4, b"c" * 4],
+            challenge_uid="challenge-1",
+            utterance_id="0",
+        ),
+        config=S2sClientConfig(pace_realtime=True, chunk_timeout_sec=3.0),
+        client=_FakeClient(),  # type: ignore[arg-type]
+    )
+    # Frame 0: no wait; frames 1..n-1 target cadence ≈ 0.08s
+    assert len(sleeps) >= 1
+    assert all(s > 0 for s in sleeps)
     assert result.timed_out_frames == [1]
 
 

@@ -22,6 +22,8 @@ class S2sClientConfig:
     drain_max_requests: int = 8
     final_drain_min_timeout_sec: float = 5.0
     init_timeout_sec: float = 600.0
+    # Real validators pace ~1/frame_rate_hz. ASAP sends starve mid-stream ASR.
+    pace_realtime: bool = False
 
 
 @dataclass(frozen=True)
@@ -124,8 +126,15 @@ def run_s2s_utterance(
         session_id = str(init.json()["session_id"])
         total_frames = len(request.frames)
         last_input_sent_at: float | None = None
+        frame_period_sec = 1.0 / FRAME_RATE_HZ
+        paced_t0 = time.perf_counter()
 
         for index, frame in enumerate(request.frames):
+            if cfg.pace_realtime:
+                target = paced_t0 + (index * frame_period_sec)
+                delay = target - time.perf_counter()
+                if delay > 0:
+                    time.sleep(delay)
             in_eos = index == total_frames - 1
             timeout_sec = frame_response_timeout_sec(
                 frame_index=index,
