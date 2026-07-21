@@ -422,7 +422,7 @@ def main() -> int:
     s2s_config = S2sClientConfig(
         chunk_timeout_sec=max(0.001, args.chunk_timeout_sec),
         drain_timeout_sec=30.0,
-        drain_max_requests=16,
+        drain_max_requests=64,
         final_drain_min_timeout_sec=10.0,
         pace_realtime=bool(args.validator_mode),
     )
