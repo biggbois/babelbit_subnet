@@ -80,3 +80,7 @@ my_chute.py
 test_logs/
 test_scores/
 data/challenge_status/
+
+# Local benchmark artifacts
+benchmark_outputs/
+
