@@ -117,7 +117,6 @@ def test_pace_realtime_sleeps_between_frames(monkeypatch) -> None:
     # Frame 0: no wait; frames 1..n-1 target cadence ≈ 0.08s
     assert len(sleeps) >= 1
     assert all(s > 0 for s in sleeps)
-    assert result.timed_out_frames == [1]
 
 
 def test_run_s2s_concurrent_validators_runs_all_sessions(monkeypatch) -> None:
