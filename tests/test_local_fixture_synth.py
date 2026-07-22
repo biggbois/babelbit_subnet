@@ -46,3 +46,41 @@ def test_float_audio_to_wav_and_concat_roundtrip() -> None:
     with wave.open(io.BytesIO(merged), "rb") as wav:
         assert wav.getframerate() == 24_000
         assert wav.getnchannels() == 1
+
+
+def test_edge_voice_for_locale_defaults() -> None:
+    assert module.edge_voice_for_locale("fr") == "fr-FR-DeniseNeural"
+    assert module.edge_voice_for_locale("de") == "de-DE-KatjaNeural"
+    with pytest.raises(ValueError, match="No default edge-tts voice"):
+        module.edge_voice_for_locale("xx")
+
+
+def test_mp3_bytes_to_wav_bytes_invokes_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[list[str]] = []
+
+    class _Completed:
+        returncode = 0
+        stdout = module.float_audio_to_wav_bytes(
+            np.linspace(-0.1, 0.1, 2400, dtype=np.float32),
+            sample_rate_hz=24_000,
+        )
+        stderr = b""
+
+    def _fake_run(cmd, **kwargs):  # noqa: ANN001
+        calls.append(list(cmd))
+        assert kwargs.get("input") == b"fake-mp3"
+        return _Completed()
+
+    monkeypatch.setattr(module.subprocess, "run", _fake_run)
+    wav = module.mp3_bytes_to_wav_bytes(b"fake-mp3", target_rate_hz=24_000)
+    assert calls and calls[0][0] == "ffmpeg"
+    assert "-ar" in calls[0]
+    assert "24000" in calls[0]
+    with wave.open(io.BytesIO(wav), "rb") as handle:
+        assert handle.getframerate() == 24_000
+        assert handle.getnchannels() == 1
+
+
+def test_mp3_bytes_to_wav_bytes_rejects_empty() -> None:
+    with pytest.raises(ValueError, match="Empty MP3"):
+        module.mp3_bytes_to_wav_bytes(b"", target_rate_hz=24_000)

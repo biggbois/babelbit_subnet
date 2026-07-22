@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+import subprocess
 import wave
 from typing import Any
 
@@ -16,6 +17,15 @@ SOURCE_LANGUAGE_LABELS = {
 }
 
 DERIVED_FROM_LOCAL = "results.babelbit.ai/dialogue-scores+local-chatterbox-tts"
+DERIVED_FROM_HAND_EDGE_TTS = "hand-translations+edge-tts"
+
+# Microsoft neural voices via edge-tts (clean FR/DE, low artifact vs Chatterbox).
+DEFAULT_EDGE_VOICES = {
+    "fr": "fr-FR-DeniseNeural",
+    "de": "de-DE-KatjaNeural",
+    "en": "en-US-JennyNeural",
+}
+DEFAULT_EDGE_RATE = "-10%"
 
 
 def challenge_uid_for_locale(base_challenge_uid: str, *, source_language: str) -> str:
@@ -24,6 +34,52 @@ def challenge_uid_for_locale(base_challenge_uid: str, *, source_language: str) -
     if lang in {"", "fr"}:
         return base_challenge_uid
     return f"{base_challenge_uid}-{lang}"
+
+
+def edge_voice_for_locale(source_language: str) -> str:
+    """Return default edge-tts neural voice for a locale."""
+    lang = source_language.strip().lower()
+    voice = DEFAULT_EDGE_VOICES.get(lang)
+    if voice is None:
+        raise ValueError(f"No default edge-tts voice for locale={source_language!r}")
+    return voice
+
+
+def mp3_bytes_to_wav_bytes(
+    mp3_bytes: bytes,
+    *,
+    target_rate_hz: int,
+    ffmpeg_bin: str = "ffmpeg",
+) -> bytes:
+    """Decode MP3 to mono 16-bit PCM WAV at target_rate_hz via ffmpeg."""
+    if not mp3_bytes:
+        raise ValueError("Empty MP3 payload")
+    completed = subprocess.run(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "wav",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "1",
+            "-ar",
+            str(int(target_rate_hz)),
+            "pipe:1",
+        ],
+        input=mp3_bytes,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0 or not completed.stdout:
+        err = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg MP3→WAV failed (code={completed.returncode}): {err}")
+    return completed.stdout
 
 
 def build_translate_system_prompt(*, source_language: str, target_language: str = "en") -> str:
