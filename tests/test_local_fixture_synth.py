@@ -95,14 +95,18 @@ def test_squash_internal_silence_shortens_long_gap() -> None:
     out = module.squash_internal_silence_pcm(
         pcm,
         sample_rate_hz=sr,
-        max_internal_silence_sec=0.12,
+        max_internal_silence_sec=0.25,
         max_edge_silence_sec=0.05,
         silence_abs_thresh=500.0,
     )
-    # Two 1s speech + <=0.12s internal (+ tiny edges)
+    # Two 1s speech + <=0.25s internal (+ tiny edges)
     assert out.size < pcm.size
-    assert out.size <= 2 * sr + int(0.12 * sr) + int(0.05 * sr) * 2
+    assert out.size <= 2 * sr + int(0.25 * sr) + int(0.05 * sr) * 2
     assert out.size >= 2 * sr
+    # 1.0s gap must compress but leave a breath (~0.25s)
+    gap_budget = out.size - 2 * sr
+    assert gap_budget <= int(0.25 * sr) + int(0.05 * sr) * 2
+    assert gap_budget >= int(0.15 * sr)
 
 
 def test_squash_silence_in_wav_bytes_roundtrip() -> None:
