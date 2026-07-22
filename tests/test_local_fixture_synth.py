@@ -57,13 +57,12 @@ def test_edge_voice_for_locale_defaults() -> None:
 
 def test_mp3_bytes_to_wav_bytes_invokes_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[list[str]] = []
+    pcm = np.linspace(-0.1, 0.1, 2400, dtype=np.float32)
+    pcm_bytes = np.clip(np.round(pcm * 32767.0), -32768, 32767).astype(np.int16).tobytes()
 
     class _Completed:
         returncode = 0
-        stdout = module.float_audio_to_wav_bytes(
-            np.linspace(-0.1, 0.1, 2400, dtype=np.float32),
-            sample_rate_hz=24_000,
-        )
+        stdout = pcm_bytes
         stderr = b""
 
     def _fake_run(cmd, **kwargs):  # noqa: ANN001
@@ -74,11 +73,13 @@ def test_mp3_bytes_to_wav_bytes_invokes_ffmpeg(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(module.subprocess, "run", _fake_run)
     wav = module.mp3_bytes_to_wav_bytes(b"fake-mp3", target_rate_hz=24_000)
     assert calls and calls[0][0] == "ffmpeg"
-    assert "-ar" in calls[0]
+    assert "-f" in calls[0] and "s16le" in calls[0]
     assert "24000" in calls[0]
     with wave.open(io.BytesIO(wav), "rb") as handle:
         assert handle.getframerate() == 24_000
         assert handle.getnchannels() == 1
+        assert handle.getnframes() == 2400
+        assert handle.getnframes() / handle.getframerate() == pytest.approx(0.1)
 
 
 def test_mp3_bytes_to_wav_bytes_rejects_empty() -> None:

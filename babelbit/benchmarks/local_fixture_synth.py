@@ -51,7 +51,11 @@ def mp3_bytes_to_wav_bytes(
     target_rate_hz: int,
     ffmpeg_bin: str = "ffmpeg",
 ) -> bytes:
-    """Decode MP3 to mono 16-bit PCM WAV at target_rate_hz via ffmpeg."""
+    """Decode MP3 to mono 16-bit PCM WAV at target_rate_hz via ffmpeg.
+
+    Uses raw s16le on the pipe (not WAV) because ffmpeg cannot rewind a pipe to
+    patch RIFF sizes, which leaves wave.open() with nframes≈2**31-1.
+    """
     if not mp3_bytes:
         raise ValueError("Empty MP3 payload")
     completed = subprocess.run(
@@ -63,7 +67,7 @@ def mp3_bytes_to_wav_bytes(
             "-i",
             "pipe:0",
             "-f",
-            "wav",
+            "s16le",
             "-acodec",
             "pcm_s16le",
             "-ac",
@@ -78,8 +82,17 @@ def mp3_bytes_to_wav_bytes(
     )
     if completed.returncode != 0 or not completed.stdout:
         err = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(f"ffmpeg MP3→WAV failed (code={completed.returncode}): {err}")
-    return completed.stdout
+        raise RuntimeError(f"ffmpeg MP3→PCM failed (code={completed.returncode}): {err}")
+    pcm = completed.stdout
+    if len(pcm) % 2 != 0:
+        raise RuntimeError("ffmpeg returned odd PCM byte length")
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(int(target_rate_hz))
+        wav.writeframes(pcm)
+    return out.getvalue()
 
 
 def build_translate_system_prompt(*, source_language: str, target_language: str = "en") -> str:
