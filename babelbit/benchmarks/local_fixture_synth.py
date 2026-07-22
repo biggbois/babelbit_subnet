@@ -26,6 +26,9 @@ DEFAULT_EDGE_VOICES = {
     "en": "en-US-JennyNeural",
 }
 DEFAULT_EDGE_RATE = "-10%"
+DEFAULT_MAX_INTERNAL_SILENCE_SEC = 0.12
+DEFAULT_MAX_EDGE_SILENCE_SEC = 0.15
+DEFAULT_SILENCE_ABS_THRESH = 500.0  # int16 RMS per analysis frame
 
 
 def challenge_uid_for_locale(base_challenge_uid: str, *, source_language: str) -> str:
@@ -92,6 +95,97 @@ def mp3_bytes_to_wav_bytes(
         wav.setsampwidth(2)
         wav.setframerate(int(target_rate_hz))
         wav.writeframes(pcm)
+    return out.getvalue()
+
+
+def squash_internal_silence_pcm(
+    samples: np.ndarray,
+    *,
+    sample_rate_hz: int,
+    max_internal_silence_sec: float = DEFAULT_MAX_INTERNAL_SILENCE_SEC,
+    max_edge_silence_sec: float = DEFAULT_MAX_EDGE_SILENCE_SEC,
+    silence_abs_thresh: float = DEFAULT_SILENCE_ABS_THRESH,
+    frame_sec: float = 0.02,
+) -> np.ndarray:
+    """Compress long quiet runs so TTS sentence pauses do not fake utterance EOS.
+
+    Keeps up to max_internal_silence_sec of silence between speech; trims long
+    leading/trailing quiet to max_edge_silence_sec.
+    """
+    pcm = np.asarray(samples, dtype=np.int16).reshape(-1)
+    if pcm.size == 0:
+        return pcm
+    hop = max(1, int(round(float(sample_rate_hz) * float(frame_sec))))
+    max_internal = max(1, int(round(float(max_internal_silence_sec) * float(sample_rate_hz))))
+    max_edge = max(0, int(round(float(max_edge_silence_sec) * float(sample_rate_hz))))
+    thresh = float(silence_abs_thresh)
+
+    # Frame-level silence mask
+    n_frames = max(1, (pcm.size + hop - 1) // hop)
+    silent_frames = np.zeros(n_frames, dtype=bool)
+    for index in range(n_frames):
+        start = index * hop
+        chunk = pcm[start : start + hop]
+        if chunk.size == 0:
+            silent_frames[index] = True
+            continue
+        rms = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+        silent_frames[index] = rms < thresh
+
+    kept: list[np.ndarray] = []
+    index = 0
+    while index < n_frames:
+        if not silent_frames[index]:
+            start = index * hop
+            end = min(pcm.size, start + hop)
+            kept.append(pcm[start:end])
+            index += 1
+            continue
+        run_start = index
+        while index < n_frames and silent_frames[index]:
+            index += 1
+        run_samples = min(pcm.size, index * hop) - run_start * hop
+        is_leading = run_start == 0
+        is_trailing = index >= n_frames
+        if is_leading or is_trailing:
+            keep_n = min(run_samples, max_edge)
+        else:
+            keep_n = min(run_samples, max_internal)
+        if keep_n > 0:
+            start = run_start * hop
+            kept.append(pcm[start : start + keep_n])
+
+    if not kept:
+        return pcm[: min(pcm.size, max_edge)]
+    return np.concatenate(kept).astype(np.int16, copy=False)
+
+
+def squash_silence_in_wav_bytes(
+    wav_bytes: bytes,
+    *,
+    max_internal_silence_sec: float = DEFAULT_MAX_INTERNAL_SILENCE_SEC,
+    max_edge_silence_sec: float = DEFAULT_MAX_EDGE_SILENCE_SEC,
+    silence_abs_thresh: float = DEFAULT_SILENCE_ABS_THRESH,
+) -> bytes:
+    """Apply squash_internal_silence_pcm to a mono 16-bit WAV payload."""
+    with wave.open(io.BytesIO(wav_bytes), "rb") as wav:
+        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
+            raise ValueError("Expected mono 16-bit WAV")
+        rate = wav.getframerate()
+        pcm = np.frombuffer(wav.readframes(wav.getnframes()), dtype=np.int16)
+    squashed = squash_internal_silence_pcm(
+        pcm,
+        sample_rate_hz=rate,
+        max_internal_silence_sec=max_internal_silence_sec,
+        max_edge_silence_sec=max_edge_silence_sec,
+        silence_abs_thresh=silence_abs_thresh,
+    )
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(squashed.tobytes())
     return out.getvalue()
 
 

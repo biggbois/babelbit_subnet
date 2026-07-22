@@ -25,6 +25,7 @@ from babelbit.benchmarks.local_fixture_synth import (
     challenge_uid_for_locale,
     edge_voice_for_locale,
     mp3_bytes_to_wav_bytes,
+    squash_silence_in_wav_bytes,
 )
 from babelbit.benchmarks.miner_test_data import (
     api_challenge_fixtures_dir,
@@ -42,11 +43,12 @@ class EdgeTTS:
     def synthesize(self, text: str, *, language_id: str) -> bytes:
         voice = edge_voice_for_locale(language_id)
         mp3 = synthesize_edge_tts_mp3_sync(text, voice=voice, rate=self.rate)
-        return mp3_bytes_to_wav_bytes(
+        wav = mp3_bytes_to_wav_bytes(
             mp3,
             target_rate_hz=BENCHMARK_SAMPLE_RATE_HZ,
             ffmpeg_bin=self.ffmpeg_bin,
         )
+        return squash_silence_in_wav_bytes(wav)
 
 
 def load_hand_translations(path: Path) -> list[dict[str, Any]]:

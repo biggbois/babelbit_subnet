@@ -85,3 +85,38 @@ def test_mp3_bytes_to_wav_bytes_invokes_ffmpeg(monkeypatch: pytest.MonkeyPatch) 
 def test_mp3_bytes_to_wav_bytes_rejects_empty() -> None:
     with pytest.raises(ValueError, match="Empty MP3"):
         module.mp3_bytes_to_wav_bytes(b"", target_rate_hz=24_000)
+
+
+def test_squash_internal_silence_shortens_long_gap() -> None:
+    sr = 24_000
+    speech = (np.linspace(-0.3, 0.3, sr, dtype=np.float32) * 10000).astype(np.int16)
+    gap = np.zeros(sr, dtype=np.int16)  # 1.0s silence
+    pcm = np.concatenate([speech, gap, speech])
+    out = module.squash_internal_silence_pcm(
+        pcm,
+        sample_rate_hz=sr,
+        max_internal_silence_sec=0.12,
+        max_edge_silence_sec=0.05,
+        silence_abs_thresh=500.0,
+    )
+    # Two 1s speech + <=0.12s internal (+ tiny edges)
+    assert out.size < pcm.size
+    assert out.size <= 2 * sr + int(0.12 * sr) + int(0.05 * sr) * 2
+    assert out.size >= 2 * sr
+
+
+def test_squash_silence_in_wav_bytes_roundtrip() -> None:
+    sr = 24_000
+    speech = (np.sin(np.linspace(0, 40, sr, dtype=np.float32)) * 8000).astype(np.int16)
+    gap = np.zeros(int(0.8 * sr), dtype=np.int16)
+    pcm = np.concatenate([speech, gap, speech])
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sr)
+        wav.writeframes(pcm.tobytes())
+    squashed = module.squash_silence_in_wav_bytes(buf.getvalue())
+    dur = module.wav_duration_sec_from_bytes(squashed)
+    assert dur < 2.8
+    assert dur > 2.0
